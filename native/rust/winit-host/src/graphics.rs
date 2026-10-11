@@ -1930,12 +1930,18 @@ impl Graphics {
                 CurrentSurfaceTexture::Success(frame) => (Some(frame), false),
                 CurrentSurfaceTexture::Suboptimal(frame) => (Some(frame), true),
                 CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {
-                    return Ok(false)
+                    // The frame's buffer writes are already queued. Submitting
+                    // nothing still flushes them; returning without a submit
+                    // leaves every write's staging buffer pending, and a hidden
+                    // or occluded window then grows without bound.
+                    self.queue.submit(std::iter::empty());
+                    return Ok(false);
                 }
                 CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Lost => {
                     // Both mean the surface no longer matches the window. Rebuilt
                     // here and drawn next frame, which is one dropped frame rather
-                    // than a dead window.
+                    // than a dead window. The queued writes are flushed as above.
+                    self.queue.submit(std::iter::empty());
                     if let Some(surface) = &self.surface {
                         surface.configure(&self.device, &self.config);
                     }
