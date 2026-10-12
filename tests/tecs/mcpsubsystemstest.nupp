@@ -7,6 +7,8 @@ local physics = require("tecs.physics")
 local audio = require("tecs.audio")
 local audiobackend = require("tecs.platform.audiobackend")
 local mcp = require("tecs.mcp")
+local application = require("tecs.application")
+local screenshot = require("tecs.gfx.screenshot")
 local registry = require("tecs.internal.mcpregistry")
 local schemas = require("tecs.internal.mcpschemas")
 local entityworld = require("tecs.internal.world")
@@ -71,14 +73,7 @@ function suite.restoredInputSchemasMatchTheHistoricalWireListing(): nil
         end
     end
     test.equal(checked, 22)
-    for _, name in ipairs({
-        "screenshot",
-        "sample_pixels",
-        "reload_shaders",
-        "reload_image",
-        "watch",
-        "physics_debug"
-    }) do
+    for _, name in ipairs({"sample_pixels", "reload_shaders", "reload_image", "watch", "physics_debug"}) do
         test.equal(registry.findTool(name), nil)
     end
 end
@@ -219,6 +214,144 @@ function suite.profileToolsWriteAReportAndCanStartAgain(): nil
     test.equal(assert(files.read(report.path)), "")
     assert(files.remove(report.path))
     test.equal(call("profile_stop").isError, true)
+end
+
+--- Builds a bound application whose Update system counts frames and records
+--- whether Space was pressed on each.
+local function steppedApplication(): (application.Application, {number}, {boolean})
+    local deltas: {number} = {}
+    local pressed: {boolean} = {}
+    local app = application.newApplication({
+        plugin = function(exclusive running: application.Application): nil
+            const input = running.input
+            running.world:addSystem({
+                name = "test.mcp.clock",
+                phase = ecs.phases.Update,
+                run = function(dt: number): nil
+                    deltas[#deltas + 1] = dt
+                    pressed[#pressed + 1] = input:keyPressed("Space")
+                end
+            })
+        end
+    })
+    app:init()
+    mcp.bind(app.world, app)
+
+    return app, deltas, pressed
+end
+
+function suite.clockToolsPauseStepAndResumeTheSimulation(): nil
+    local app, deltas, pressed = steppedApplication()
+    app:iterate(0.5, nil)
+
+    local info = content("clock_info")
+    test.equal(info.paused, false)
+    test.equal(info.settled, false)
+    test.equal(info.frame, 1)
+    test.equal(call("clock_step").isError, true)
+
+    test.equal(content("clock_pause").paused, true)
+    content("send_event", {kind = "keyDown", physicalKey = "Space", logicalKey = " "})
+    app:iterate(0.5, nil)
+    app:iterate(0.5, nil)
+    test.equal(#deltas, 1)
+    info = content("clock_info")
+    test.equal(info.settled, true)
+    test.equal(info.pendingEvents, 1)
+
+    local stepped = content("clock_step", {frames = 2, dt = 0.125})
+    test.equal(stepped.pendingSteps, 2)
+    test.equal(stepped.stepDt, 0.125)
+    test.equal(stepped.settled, false)
+    app:iterate(0.5, nil)
+    app:iterate(0.5, nil)
+    app:iterate(0.5, nil)
+    test.equal(#deltas, 3)
+    test.equal(deltas[2], 0.125)
+    test.equal(deltas[3], 0.125)
+    test.assert(pressed[2])
+    test.assert(not pressed[3])
+    info = content("clock_info")
+    test.equal(info.frame, 3)
+    test.equal(info.elapsed, 0.75)
+    test.equal(info.settled, true)
+
+    test.equal(call("clock_step", {frames = 1.5}).isError, true)
+    test.equal(call("clock_step", {dt = 0}).isError, true)
+    test.equal(call("clock_step", {frames = 0}).isError, true)
+
+    content("clock_step", {frames = 4})
+    test.equal(content("clock_resume").paused, false)
+    test.equal(content("clock_info").pendingSteps, 0)
+    app:iterate(0.5, nil)
+    test.equal(deltas[4], 0.5)
+
+    mcp.bind(nil, nil)
+    app:shutdown()
+end
+
+function suite.clockAndInputToolsAnswerWhileAFrameIsParked(): nil
+    local app = steppedApplication()
+    content("clock_pause")
+    for _, name in ipairs({"clock_info", "clock_step", "send_event", "screenshot", "screenshot_info"}) do
+        test.equal(assert(registry.findTool(name)).whenParked, true)
+    end
+    local parked = registry.callTool(assert(registry.findTool("clock_info")), {}, true)
+    test.equal(parked.structuredContent.parked, true)
+    test.equal(parked.structuredContent.settled, false)
+    local sent = registry.callTool(
+        assert(registry.findTool("send_event")),
+        {kind = "keyDown", physicalKey = "KeyA"},
+        true
+    )
+    test.equal(sent.isError, nil)
+    test.equal(app:pendingEvents(), 1)
+    -- A tool that touches the world still waits for the frame.
+    test.equal(registry.callTool(assert(registry.findTool("stats")), {}, true).isError, true)
+
+    mcp.bind(nil, nil)
+    app:shutdown()
+end
+
+function suite.screenshotToolWritesTheNextRenderedFrame(): nil
+    local app = steppedApplication()
+    screenshot.cancelPending()
+    local requested = content("screenshot", {name = "mcp-screenshot-test.png"})
+    test.equal(requested.ready, false)
+    test.assert(requested.path:find("mcp-screenshot-test.png", 1, true) ~= nil)
+    test.equal(content("screenshot_info", {id = requested.id}).ready, false)
+
+    -- What the host does after it renders: it consumes the request and
+    -- answers with the frame.
+    local id = assert(screenshot.nextRequest())
+    screenshot.complete(id, 1, 1, "\1\2\3\255", "PNG-BYTES", nil)
+    local server = assert(mcp.listen(0))
+    mcp.poll(server)
+    test.equal(assert(files.read(requested.path)), "PNG-BYTES")
+    local written = content("screenshot_info", {id = requested.id})
+    test.equal(written.ready, true)
+    test.equal(written.saved, true)
+    test.equal(written.width, 1)
+    test.equal(written.height, 1)
+    test.equal(written.bytes, 9)
+    assert(files.remove(requested.path))
+
+    -- A failed readback is reported rather than written.
+    local failing = content("screenshot", {name = "mcp-screenshot-failed.png"})
+    screenshot.complete(assert(screenshot.nextRequest()), 0, 0, "", "", "GPU readback failed")
+    local failed = content("screenshot_info", {id = failing.id})
+    test.equal(failed.ready, true)
+    test.equal(failed.saved, false)
+    test.equal(failed.reason, "GPU readback failed")
+
+    test.equal(call("screenshot", {path = "relative.png"}).isError, true)
+    test.equal(call("screenshot_info", {id = 999999}).isError, true)
+    test.equal(content("describe", {command = "screenshot"}).action.name, "screenshot")
+    test.equal(#content("describe", {command = "clock"}).verbs, 4)
+
+    mcp.destroy(server)
+    mcp.bind(nil, nil)
+    app:shutdown()
 end
 
 return suite

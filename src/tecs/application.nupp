@@ -20,6 +20,29 @@ parks asynchronous startup as well as updates. A custom host must follow the
 same ordering. Diagnostics remain available during a parked operation; tools
 that could touch its in-progress world report a retryable refusal.
 
+## Driving frames from outside
+
+A test harness or debugger drives an application deterministically with three
+calls, which the MCP `send_event` and `clock_*` tools reach. `queueEvent`
+queues a platform event for the next frame that runs, delivered after the
+host's batch for that turn exactly as a platform event is, so per-frame edges
+such as `keyPressed` survive the frame's `beginFrame`. `pause` holds the
+simulation: an iteration that has no granted frame runs no system, folds no
+input, leaves `frame` and `elapsed` unchanged, and keeps the host's events for
+the frame that eventually runs, honoring only a quit. The host keeps rendering
+the held world, so a screenshot requested while paused shows it. `step` grants
+frames that run while paused, each with the fixed delta it names rather than
+the host's measured one, so a paused application advances by exactly the
+granted frames and simulated time.
+
+```nupp
+app:pause()
+app:queueEvent(tecs.platform.events.key(true, "Space", " ", " ", 0, false, 0))
+app:step(1, 1 / 60)
+app:iterate(0.5, nil) -- runs one frame with dt 1/60 and sees Space pressed
+app:iterate(0.5, nil) -- holds: no frame, no time
+```
+
 Shutdown first unwinds a parked host operation, then attempts world shutdown,
 stops the loader, and closes the debug listener. Later application cleanup
 still runs if world shutdown raises. Resident asset handles retain their
@@ -72,6 +95,10 @@ export record Application is mcpbindings.Application
     elapsed: number
     frame: integer
 
+    --- Read-only. Reports whether `pause` holds the simulation. Change it through
+    --- `pause` and `resume`.
+    paused: boolean
+
     @private state: State
     @private plugin: Plugin?
     @private onEvent: (function(event: platformevents.Event, exclusive app: Application): nil)?
@@ -81,6 +108,10 @@ export record Application is mcpbindings.Application
     @private debugMaxFrames: integer?
     @private failure: string?
     @private shutdownDone: boolean
+    @private steps: integer
+    @private stepDt: number
+    @private held: {platformevents.Event}
+    @private injected: {platformevents.Event}
 
     --- Polls optional debugging once per host turn, outside the world update scope.
     --- @param self the application to serve.
@@ -96,6 +127,64 @@ export record Application is mcpbindings.Application
     clearCrash: function(exclusive self: Application): (boolean, string?)
     shutdown: function(exclusive self: Application): boolean
     getState: function(borrows self: Application): State
+
+    --- Queues a platform event for the next frame that runs.
+    ---
+    --- The event reaches window state, input state, the world's observers and
+    --- `Config.onEvent` after that frame's `beginFrame`, behind the host's own
+    --- batch for the same turn, so per-frame edges such as `keyPressed` read
+    --- true for exactly that frame. While paused the event waits for the next
+    --- frame `step` or `resume` lets run.
+    --- @param self the application to deliver to
+    --- @param event the event, delivered as if the platform had sent it
+    queueEvent: function(exclusive self: Application, event: platformevents.Event): nil
+
+    --- Holds the simulation from the next iteration on.
+    ---
+    --- A held iteration runs no system and folds no input, and leaves `frame`
+    --- and `elapsed` unchanged. Host events wait for the next frame that runs,
+    --- up to the latest 1024, except that a quit or close request still stops
+    --- the application. The
+    --- host keeps rendering the held world. Pausing again does nothing, and
+    --- frames already granted by `step` are kept.
+    --- @param self the application to hold
+    pause: function(exclusive self: Application): nil
+
+    --- Lets the simulation run on the host's measured delta again.
+    ---
+    --- Discards any frames `step` granted and has not run yet. Resuming a
+    --- running application does nothing.
+    --- @param self the application to release
+    resume: function(exclusive self: Application): nil
+
+    --- Grants frames that run while paused, one per host iteration.
+    ---
+    --- Each granted frame passes `dt` to the world in place of the host's
+    --- delta, so a script of steps reproduces the same simulated time on every
+    --- run and every host. The delta applies to every granted frame not yet
+    --- run, including ones an earlier call granted.
+    --- @param self the paused application
+    --- @param frames how many more frames to run, at least one
+    --- @param dt the fixed delta of each granted frame, in seconds
+    --- @raises string when the application is not paused
+    --- @raises string when `frames` is not a positive integer or `dt` is not a
+    ---     positive finite number
+    step: function(exclusive self: Application, frames: integer, dt: number): nil
+
+    --- Returns the frames `step` granted that have not started.
+    --- @param self the application to inspect
+    --- @return the count, zero while running or once every granted frame ran
+    pendingSteps: function(borrows self: Application): integer
+
+    --- Returns the fixed delta granted frames run with.
+    --- @param self the application to inspect
+    --- @return the delta in seconds the last `step` named, or 1/60 before one
+    stepDelta: function(borrows self: Application): number
+
+    --- Returns how many events wait for the next frame that runs.
+    --- @param self the application to inspect
+    --- @return the count of queued and held events
+    pendingEvents: function(borrows self: Application): integer
 end
 
 --- Settings copied by `newApplication`.
@@ -111,6 +200,10 @@ export type Config = {
     debug: boolean?,
     debugMaxFrames: integer?
 }
+
+-- The most events a paused application holds for its next frame. Past it the
+-- oldest are dropped, as the host's own input routes drop theirs.
+local HELD_LIMIT: integer = 1024
 
 -- The tool registry names one application per runtime. A second listener must
 -- not silently redirect the first application's tools into another world.
@@ -179,7 +272,12 @@ export function newApplication(config: Config?): Application
         debug = config ~= nil and config.debug == true,
         debugMaxFrames = maxFrames,
         failure = nil,
-        shutdownDone = false
+        shutdownDone = false,
+        paused = false,
+        steps = 0,
+        stepDt = 1 / 60,
+        held = {},
+        injected = {}
     )
     app.bindDebug = function(): nil
         debugOwner = app
@@ -263,8 +361,45 @@ function Application.iterate(exclusive self: Application, dt: number, batch: {pl
         return false
     end
 
+    -- Arrival order: events held while paused, then this turn's host batch,
+    -- then what `queueEvent` added since the last iteration.
+    local incoming = self.held
+    for _, event in ipairs(batch or {}) do
+        incoming[#incoming + 1] = event
+    end
+    for _, event in ipairs(self.injected) do
+        incoming[#incoming + 1] = event
+    end
+    self.held = {}
+    self.injected = {}
+    if self.paused then
+        if self.steps <= 0 then
+            -- A held turn: nothing runs and the events wait for a frame that
+            -- does, but a quit is a request to the process rather than to a
+            -- frame, so it is still honored.
+            for index = 1, #incoming do
+                if incoming[index] is platformevents.QuitEvent then
+                    self.quitRequested = true
+                    return false
+                end
+            end
+            if #incoming > HELD_LIMIT then
+                -- A long pause under a live window must not grow without bound.
+                local kept: {platformevents.Event} = {}
+                for index = #incoming - HELD_LIMIT + 1, #incoming do
+                    kept[#kept + 1] = incoming[index]
+                end
+                incoming = kept
+            end
+            self.held = incoming
+
+            return true
+        end
+        self.steps = self.steps - 1
+        dt = self.stepDt
+    end
+
     self.input:beginFrame()
-    local incoming = batch or {}
     local handler = self.onEvent
     for index = 1, #incoming do
         local event = incoming[index]
@@ -305,6 +440,45 @@ function Application.iterate(exclusive self: Application, dt: number, batch: {pl
     end
 
     return not self.quitRequested
+end
+
+function Application.queueEvent(exclusive self: Application, event: platformevents.Event): nil
+    self.injected[#self.injected + 1] = event
+end
+
+function Application.pause(exclusive self: Application): nil
+    self.paused = true
+end
+
+function Application.resume(exclusive self: Application): nil
+    self.paused = false
+    self.steps = 0
+end
+
+function Application.step(exclusive self: Application, frames: integer, dt: number): nil
+    if not self.paused then
+        error("application.step: the application is not paused", 2)
+    end
+    if frames < 1 or frames % 1 ~= 0 then
+        error("application.step: frames must be a positive integer", 2)
+    end
+    if not (dt > 0) or dt == math.huge then
+        error("application.step: dt must be a positive finite number", 2)
+    end
+    self.steps = self.steps + frames
+    self.stepDt = dt
+end
+
+function Application.pendingSteps(borrows self: Application): integer
+    return self.steps
+end
+
+function Application.stepDelta(borrows self: Application): number
+    return self.stepDt
+end
+
+function Application.pendingEvents(borrows self: Application): integer
+    return #self.held + #self.injected
 end
 
 --- Requests that the host stop after the current callback returns.

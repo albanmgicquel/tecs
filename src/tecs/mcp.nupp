@@ -12,10 +12,12 @@ including after a crash or while gameplay is suspended. For a standalone
 server, call `poll` outside the world update scope and `destroy` at teardown.
 Each poll answers at most one tool request; handlers must answer promptly.
 
-While a lifecycle operation is parked, `ping`, `context` and `get_logs` remain
-available. Other tools report that the operation must complete first. A custom
-tool may opt in with `whenParked = true` only if it never touches the in-progress
-world. `readOnly` alone grants no such permission.
+While a lifecycle operation is parked, `ping`, `context`, `get_logs`,
+`send_event`, the `clock_*` tools and the `screenshot` tools remain available.
+Other tools report that the operation must complete first; `clock_info`
+reports `parked` so an agent can wait for the frame instead of retrying them. A
+custom tool may opt in with `whenParked = true` only if it never touches the
+in-progress world. `readOnly` alone grants no such permission.
 
 ```nupp
 local server = assert(tecs.mcp.listen(7100))
@@ -57,11 +59,43 @@ component update and `set` for a complete value or a missing component.
 structured tools to `run_lua`; the Lua sandbox limits accidents but does not
 create a security boundary.
 
+## Driving frames deterministically
+
+`send_event` queues its event for the next frame that runs, behind the host's
+own input for that frame, so a key it sends is pressed on exactly that frame.
+`clock_pause` holds the simulation: host turns run no system and fold no input,
+and `frame` and `elapsed` stand still, while the host keeps rendering the held
+world. `clock_step` grants frames to a paused clock, one per host turn, each
+with a fixed `dt` (1/60 s by default) instead of the measured one, and
+`clock_resume` returns to the host's delta. `clock_info` reports `settled` once
+a paused clock has run every granted frame and no frame is parked mid-flight,
+which is when the world is safe to read.
+
+`screenshot` requests a capture of the next rendered frame and answers at once
+with an `id` and the `path` it will write, under the writable root or at an
+absolute `path`. The server writes the PNG on its first poll after the host
+reads the frame back, in a windowed or an `--offscreen` host, and
+`screenshot_info` reports `ready`, `saved`, the size, or the failure. A
+`--headless` host renders nothing, so its captures never become ready.
+
+A harness turn, as JSON-RPC `tools/call` requests:
+
+```text
+clock_pause  {}
+send_event   {"kind": "keyDown", "physicalKey": "Space"}
+clock_step   {"frames": 1}
+clock_info   {}                      -- repeat until "settled": true
+send_event   {"kind": "keyUp", "physicalKey": "Space"}
+clock_step   {"frames": 1}
+screenshot   {"path": "/tmp/frame.png"}
+screenshot_info {"id": 1}            -- repeat until "ready": true
+```
+
 ## After a crash
 
 `setCrashed` records a guarded gameplay failure. The server keeps polling after
-one: `ping`, `context`, `get_logs`, `send_event` and `clear_crash` remain
-available, and every tool that touches the world reports the stored traceback
+one: `ping`, `context`, `get_logs`, `send_event`, `clear_crash`, the
+`clock_*` tools and the `screenshot` tools remain available, and every tool that touches the world reports the stored traceback
 instead of running.
 
 ## Subsystem tools
@@ -74,7 +108,7 @@ sampler; stop writes collapsed stacks under the writable root.
 
 `help`, `describe` and `capabilities` enumerate the live registry. They and the
 sampler remain available while parked or crashed. The server does not provide
-GPU readback, shader or image reload, watcher orchestration, or physics debug
+pixel sampling, shader or image reload, watcher orchestration, or physics debug
 overlay tools. Snapshot files use TECS framing over Nupp's binary codec and
 refuse unsupported framing or physics encodings.
 ]]
@@ -247,6 +281,7 @@ export function poll(exclusive self: Server, parked: boolean?): boolean
         self.endpoint:setTools(registry.describeJSON())
     end
     self.endpoint:pump()
+    subsystems.settleCaptures()
 
     local request = self.endpoint:nextRequest()
     if request == nil then

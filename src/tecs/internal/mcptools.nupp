@@ -24,7 +24,6 @@ local ecs = require("tecs.ecs")
 local files = require("nupp.io.files")
 local json = require("nupp.codec.json")
 local platformevents = require("tecs.platform.events")
-local platformwindow = require("tecs.platform.window")
 local time = require("nupp.time")
 local bindings = require("tecs.internal.mcpbindings")
 local registry = require("tecs.internal.mcpregistry")
@@ -325,10 +324,19 @@ registry.register({
     -- reading a recording or the event reference already knows; the Teal tool
     -- itself exposed none of them, so it could list `gamepadAxis` among its
     -- kinds and then not let anyone push one.
+    --
+    -- The event is queued for the next frame that runs rather than folded into
+    -- the input on the spot. A tool call lands between frames, before the next
+    -- frame's `beginFrame` clears the per-frame edges, so a key folded
+    -- immediately was down but never pressed. Queuing only touches the
+    -- application's queue, which is why the tool may also run while a frame is
+    -- parked.
     name = "send_event",
-    description = "Pushes an event into the input stream, as if it had come from the platform.",
+    description = "Queues an event for the next frame that runs, delivered after "
+    .. "the host's own input for that frame as if it had come from the platform.",
     destructive = true,
     whenCrashed = true,
+    whenParked = true,
     inputSchema = {
         type = "object",
         properties = {
@@ -382,17 +390,12 @@ registry.register({
 
         local event = buildEvent(kind, arguments)
         local app = bindings.requireApplication()
-        -- The same three folds one host iteration performs on a sealed batch,
-        -- so a synthetic event reaches window state, input state and the
-        -- world's observers exactly as a real one does.
-        platformwindow.handleEvent(app.window, event)
-        app.input:handleEvent(event)
-        platformevents.dispatch(app.world, event)
-        if event is platformevents.Quit or event is platformevents.WindowCloseRequested then
-            app:requestQuit()
-        end
+        -- The next frame folds it with the host's own batch, so it reaches
+        -- window state, input state, the world's observers and a quit request
+        -- exactly as a real event does.
+        app:queueEvent(event)
 
-        return {pushed = kind}
+        return {pushed = kind, frame = app.frame, pending = app:pendingEvents()}
     end
 })
 

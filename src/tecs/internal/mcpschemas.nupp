@@ -278,3 +278,75 @@ export const inputs: {
         ["additionalProperties"] = false
     }
 }
+
+-- Schemas for tools added after that listing, so not checked against it.
+-- `screenshot` keeps the historical tool's `name` key and adds `path`. Names
+-- and argument keys are external compatibility contracts all the same.
+export const added: {
+    [string]: any
+} = {
+    ["clock_info"] = {["properties"] = json.EMPTY_OBJECT, ["type"] = "object", ["additionalProperties"] = false},
+    ["clock_pause"] = {["properties"] = json.EMPTY_OBJECT, ["type"] = "object", ["additionalProperties"] = false},
+    ["clock_resume"] = {["properties"] = json.EMPTY_OBJECT, ["type"] = "object", ["additionalProperties"] = false},
+    [
+        "clock_step"
+    ] = {
+        [
+            "properties"
+        ] = {
+            [
+                "frames"
+            ] = {
+                ["type"] = "number",
+                ["description"] = "Sets how many more frames run, as a whole number. (default: 1)",
+                ["minimum"] = 1
+            },
+            [
+                "dt"
+            ] = {
+                ["type"] = "number",
+                ["description"] = "Sets the fixed delta of each granted frame in seconds. (default: 1/60)",
+                ["minimum"] = 1e-06,
+                ["maximum"] = 1
+            }
+        },
+        ["type"] = "object",
+        ["additionalProperties"] = false
+    },
+    [
+        "screenshot"
+    ] = {
+        [
+            "properties"
+        ] = {
+            [
+                "name"
+            ] = {
+                ["type"] = "string",
+                ["description"] = "File name under the writable root. Defaults to screenshot.png."
+            },
+            [
+                "path"
+            ] = {
+                ["type"] = "string",
+                ["description"] = "Writes the PNG at this absolute path instead of under the writable root."
+            }
+        },
+        ["type"] = "object",
+        ["additionalProperties"] = false
+    },
+    [
+        "screenshot_info"
+    ] = {
+        [
+            "properties"
+        ] = {
+            [
+                "id"
+            ] = {["type"] = "number", ["description"] = "Selects the capture `screenshot` reported.", ["minimum"] = 1}
+        },
+        ["required"] = {"id"},
+        ["type"] = "object",
+        ["additionalProperties"] = false
+    }
+}

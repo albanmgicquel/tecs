@@ -357,6 +357,17 @@ suspends, later events wait for the next update. Watcher changes use the same
 boundary. The scheduler therefore commits a phase once and extraction never
 observes half of an external batch.
 
+Synthetic input takes the same boundary. The debug server's `send_event` used
+to fold its event into input state the moment the tool ran, which is between
+frames: the next frame's `beginFrame` then cleared the edges, so an injected
+key was down but never pressed, and a test harness had to queue events inside
+the game instead. The application now queues them and delivers them after the
+host's batch on the next frame that runs. Pausing is the application's rather
+than the host's for the same reason: a held iteration keeps its events for the
+frame that runs and a stepped frame takes a fixed delta, so a paused game
+advances by exactly the frames granted, on any host, while the host keeps
+rendering and serving screenshots of the held world.
+
 ### Application lifecycle and presentation timing
 
 The application owns asset orchestration and optional debugging because both
