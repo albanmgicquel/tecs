@@ -180,7 +180,7 @@ function suite.inspectsAndControlsARunningApplicationOverTheTransport(): nil
         callOverHTTP(port, "states_pop")
         test.equal(callOverHTTP(port, "states_info").depth as integer, 0)
 
-        -- Control: a synthetic event reaches the same folds a real one does.
+        -- Control: a synthetic event is queued for the folds a real one takes.
         local sent = callOverHTTP(port, "send_event", {kind = "keyDown", physicalKey = "KeyF"})
         test.equal(sent.pushed as string, "keyDown")
 
@@ -190,6 +190,10 @@ function suite.inspectsAndControlsARunningApplicationOverTheTransport(): nil
         test.equal(callOverHTTP(port, "stats").entities as integer, 3)
     end)
 
+    -- The synthetic key arrives with the next frame, as a platform key does.
+    test.assert(not app.input:keyDown("KeyF"))
+    app:iterate(1 / 60, nil)
+    test.assert(app.input:keyPressed("KeyF"))
     test.assert(app.input:keyDown("KeyF"))
 
     -- The stopped system does not run, so the counter it owns stands still.

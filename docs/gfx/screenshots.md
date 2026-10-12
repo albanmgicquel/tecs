@@ -47,3 +47,8 @@ Only requested frames allocate readback storage and wait for GPU completion.
 Keep captures for as long as needed; releasing your references allows their
 pixel and PNG data to be collected. Several requests for one frame share its
 GPU readback.
+
+The debug server's `screenshot` tool requests the same capture from outside
+the game and writes the PNG once the host has rendered the frame;
+`screenshot_info` reports when it is written. See [](tecs.mcp) for the tool
+and for pausing and stepping the simulation around it.

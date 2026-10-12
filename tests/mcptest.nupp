@@ -297,6 +297,9 @@ function suite.pushesTouchAndGamepadEventsThroughSendEvent(): nil
         }),
         "fingerDown"
     )
+    -- Queued for the next frame rather than folded on the spot.
+    test.equal(#app.input:touches(), 0)
+    app:iterate(1 / 60, nil)
     local held = app.input:touches()
     test.equal(#held, 1)
     test.equal(held[1].finger, "1")
@@ -307,12 +310,47 @@ function suite.pushesTouchAndGamepadEventsThroughSendEvent(): nil
     test.equal(pushed({kind = "gamepadAdded", which = 4}), "gamepadAdded")
     test.equal(pushed({kind = "gamepadButtonDown", which = 4, button = 1}), "gamepadButtonDown")
     test.equal(pushed({kind = "gamepadAxis", which = 4, axis = 1, value = 0.8}), "gamepadAxis")
+    app:iterate(1 / 60, nil)
 
     local pad = assert(app.input:gamepadById(4))
     test.assert(pad:buttonDown("south"))
     test.equal(pad:axis("leftX"), 0.8)
 
     test.matches(errorText(call("send_event", {kind = "fingerMotion", x = 1, y = 1})), "finger is required")
+
+    mcp.bind(nil, nil)
+    app:shutdown()
+end
+
+function suite.sendEventKeyIsPressedOnTheNextFrame(): nil
+    local pressedOn: {integer} = {}
+    local frames: integer = 0
+    local app: application.Application = application.newApplication({
+        plugin = function(exclusive running: application.Application): nil
+            const input = running.input
+            running.world:addSystem({
+                name = "test.mcp.pressed",
+                phase = ecs.phases.Update,
+                run = function(_dt: number): nil
+                    frames = frames + 1
+                    if input:keyPressed("KeyQ") then
+                        pressedOn[#pressedOn + 1] = frames
+                    end
+                end
+            })
+        end
+    })
+    app:init()
+    mcp.bind(app.world, app)
+    app:iterate(1 / 60, nil)
+
+    local sent = call("send_event", {kind = "keyDown", physicalKey = "KeyQ"}).structuredContent as {[string]: any}
+    test.equal(sent.pending as integer, 1)
+    app:iterate(1 / 60, nil)
+    app:iterate(1 / 60, nil)
+    test.equal(#pressedOn, 1)
+    test.equal(pressedOn[1], 2)
+    test.assert(app.input:keyDown("KeyQ"))
 
     mcp.bind(nil, nil)
     app:shutdown()
