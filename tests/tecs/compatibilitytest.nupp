@@ -687,6 +687,10 @@ function suite.mcpToolNames(): nil
         "camera_move",
         "capabilities",
         "clear_crash",
+        "clock_info",
+        "clock_pause",
+        "clock_resume",
+        "clock_step",
         "components_info",
         "context",
         "describe",
@@ -711,6 +715,8 @@ function suite.mcpToolNames(): nil
         "resources_info",
         "resources_list",
         "run_lua",
+        "screenshot",
+        "screenshot_info",
         "send_event",
         "set",
         "snapshot_load",
@@ -769,6 +775,12 @@ function suite.mcpArgumentKeys(): nil
     equalList(argumentKeys("systems_start"), {"name"})
     equalList(argumentKeys("systems_stop"), {"name"})
     equalList(argumentKeys("states_push"), {"name"})
+    equalList(argumentKeys("clock_info"), {})
+    equalList(argumentKeys("clock_pause"), {})
+    equalList(argumentKeys("clock_resume"), {})
+    equalList(argumentKeys("clock_step"), {"dt", "frames"})
+    equalList(argumentKeys("screenshot"), {"name", "path"})
+    equalList(argumentKeys("screenshot_info"), {"id"})
 end
 
 function suite.sendEventArgumentKeys(): nil

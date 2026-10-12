@@ -82,6 +82,18 @@ local revision: integer = 0
 --- The traceback of a guarded game failure, once one has been recorded.
 local crashedText: string? = nil
 
+--- Whether the tool call in progress runs while a lifecycle operation is parked.
+local callingParked: boolean = false
+
+--- Reports whether the tool call in progress runs while a lifecycle
+--- operation is parked, which a `whenParked` handler reads to tell an agent
+--- that a frame is still mid-flight.
+--- @return true inside a handler called during a parked operation, and false
+---     otherwise, including outside any handler
+export function parkedCall(): boolean
+    return callingParked
+end
+
 --- Records a crash so every world-touching tool reports it instead of running.
 --- @param traceback the failure text, or nil to clear the crashed state
 export function setCrashed(traceback: string?): nil
@@ -202,7 +214,9 @@ export function callTool(tool: Tool, arguments: {[string]: any}, parked: boolean
     end
     -- A tool that raises must not take the server with it: the agent is told,
     -- and the frame carries on.
+    callingParked = parked == true
     local called, payload = pcall(tool.handler, arguments)
+    callingParked = false
     if not called then
         logger:warn("tool %s failed: %s", tool.name, tostring(payload))
 

@@ -16,6 +16,7 @@ share one binding without either requiring the other.
 local ecs = require("tecs.ecs")
 
 local input = require("tecs.input")
+local platformevents = require("tecs.platform.events")
 local window = require("tecs.platform.window")
 
 --- The application surface debug tools use, independent of lifecycle ownership.
@@ -29,6 +30,14 @@ export interface Application
     getState: function(borrows self: Application): string
     requestQuit: function(exclusive self: Application): nil
     clearCrash: function(exclusive self: Application): (boolean, string?)
+    paused: boolean
+    queueEvent: function(exclusive self: Application, event: platformevents.Event): nil
+    pause: function(exclusive self: Application): nil
+    resume: function(exclusive self: Application): nil
+    step: function(exclusive self: Application, frames: integer, dt: number): nil
+    pendingSteps: function(borrows self: Application): integer
+    stepDelta: function(borrows self: Application): number
+    pendingEvents: function(borrows self: Application): integer
 end
 
 local boundWorld: ecs.World? = nil

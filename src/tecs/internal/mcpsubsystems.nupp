@@ -14,6 +14,7 @@ local materials = require("tecs.gpu.materials")
 local layers = require("tecs.gfx.layers")
 local physics = require("tecs.physics")
 local audio = require("tecs.audio")
+local screenshot = require("tecs.gfx.screenshot")
 local files = require("nupp.io.files")
 local path = require("nupp.io.path")
 local json = require("nupp.codec.json")
@@ -27,7 +28,7 @@ local function register(
     mutates: boolean?,
     independent: boolean?
 ): nil
-    local schema = schemas.inputs[name]
+    local schema = schemas.inputs[name] ?? schemas.added[name]
     registry.register({
         name = name,
         description = description,
@@ -241,13 +242,8 @@ register(
             layers = layers.MAX,
             camera = cameraInfo(),
             frame = app ~= nil and app.frame or 0,
-            observations = {gpuCounters = false, readback = false},
-            unavailable = json.asArray({
-                "presented frame ID",
-                "GPU timings",
-                "visible instance count",
-                "pixel readback"
-            })
+            observations = {gpuCounters = false, readback = true},
+            unavailable = json.asArray({"presented frame ID", "GPU timings", "visible instance count"})
         }
     end
 )
@@ -432,6 +428,195 @@ register(
     true
 )
 
+-------------------------------------------------------------------------------
+-- The simulation clock
+--
+-- `clock_pause`, `clock_step`, `clock_resume` and `clock_info` reach the
+-- application's pause, step and queue state only, never the world, so they run
+-- while a frame is parked and after a crash. A harness polls `clock_info` until
+-- `settled` rather than retrying a refused world tool.
+-------------------------------------------------------------------------------
+
+local function clockInfo(): {[string]: any}
+    local app = bindings.requireApplication()
+    local parked = registry.parkedCall()
+    local steps = app:pendingSteps()
+
+    return {
+        paused = app.paused,
+        frame = app.frame,
+        elapsed = app.elapsed,
+        pendingSteps = steps,
+        pendingEvents = app:pendingEvents(),
+        stepDt = app:stepDelta(),
+        parked = parked,
+        settled = app.paused and steps == 0 and not parked
+    }
+end
+
+register(
+    "clock_info",
+    "Report whether the simulation is paused, the frame count, granted frames still to run, and whether a frame is "
+    .. "parked mid-flight. `settled` is true once a paused clock has run every granted frame.",
+    function(_args: {[string]: any}): {[string]: any}
+        return clockInfo()
+    end,
+    false,
+    true
+)
+register(
+    "clock_pause",
+    "Hold the simulation: host turns run no system and fold no input until clock_step grants frames or clock_resume "
+    .. "releases it. Rendering continues.",
+    function(_args: {[string]: any}): {[string]: any}
+        local app = bindings.requireApplication()
+        app:pause()
+        return clockInfo()
+    end,
+    true,
+    true
+)
+register(
+    "clock_step",
+    "Grant frames to a paused simulation, one per host turn, each with a fixed delta instead of the wall clock.",
+    function(args: {[string]: any}): {[string]: any}
+        local app = bindings.requireApplication()
+        if not app.paused then
+            error("not_paused: the clock is running; call clock_pause before clock_step", 0)
+        end
+        app:step(integer(args.frames or 1), args.dt or 1 / 60)
+
+        return clockInfo()
+    end,
+    true,
+    true
+)
+register(
+    "clock_resume",
+    "Let the simulation run on the host's measured delta again, discarding granted frames not yet run.",
+    function(_args: {[string]: any}): {[string]: any}
+        local app = bindings.requireApplication()
+        app:resume()
+        return clockInfo()
+    end,
+    true,
+    true
+)
+
+-------------------------------------------------------------------------------
+-- Screenshots
+--
+-- The host reads back a frame only after it renders one, so a tool call can
+-- only request a capture. The server writes each finished capture from its
+-- next poll, and `screenshot_info` reports it.
+-------------------------------------------------------------------------------
+
+local type Shot = {
+    id: integer,
+    path: string,
+    capture: screenshot.Capture?,
+    ready: boolean,
+    saved: boolean,
+    reason: string?,
+    width: integer,
+    height: integer,
+    bytes: integer
+}
+
+local shots: {[integer]: Shot} = {}
+local waiting: {Shot} = {}
+local shotSerial: integer = 0
+
+--- Writes every requested screenshot whose frame the host has read back.
+---
+--- `tecs.mcp.poll` calls this once per poll, so a capture lands on disk on the
+--- turn after the host renders it whether or not anyone asks.
+export function settleCaptures(): nil
+    if #waiting == 0 then
+        return
+    end
+    local still: {Shot} = {}
+    for _, shot in ipairs(waiting) do
+        local capture = shot.capture
+        if capture ~= nil and capture.ready then
+            shot.capture = nil
+            local _, width, height = screenshot.pixels(capture)
+            local png, failure = screenshot.encode(capture)
+            if png == nil then
+                shot.reason = failure
+            else
+                local saved, reason = screenshot.save(capture, shot.path)
+                shot.saved = saved
+                shot.reason = reason
+                shot.width, shot.height, shot.bytes = width, height, #png
+            end
+            shot.ready = true
+        else
+            still[#still + 1] = shot
+        end
+    end
+    waiting = still
+end
+
+local function shotInfo(borrows shot: Shot): {[string]: any}
+    return {
+        id = shot.id,
+        path = shot.path,
+        ready = shot.ready,
+        saved = shot.saved,
+        reason = shot.reason ?? json.NULL,
+        width = shot.width,
+        height = shot.height,
+        bytes = shot.bytes
+    }
+end
+
+register(
+    "screenshot",
+    "Capture the next rendered frame to a PNG under the writable root or at an absolute path. Returns at once with "
+    .. "the capture's id and path; screenshot_info reports when the file is written.",
+    function(args: {[string]: any}): {[string]: any}
+        local destination: string
+        if args.path ~= nil then
+            assert(path.newPath(args.path):isAbsolute(), "screenshot path must be absolute")
+            destination = args.path
+        else
+            destination = artifact(args.name or "screenshot.png")
+        end
+        shotSerial = shotSerial + 1
+        const shot: Shot = {
+            id = shotSerial,
+            path = destination,
+            capture = screenshot.request(),
+            ready = false,
+            saved = false,
+            reason = nil,
+            width = 0,
+            height = 0,
+            bytes = 0
+        }
+        shots[shot.id] = shot
+        waiting[#waiting + 1] = shot
+
+        return shotInfo(shot)
+    end,
+    true,
+    true
+)
+register(
+    "screenshot_info",
+    "Report whether a requested screenshot has been written, with its size or why it failed.",
+    function(args: {[string]: any}): {[string]: any}
+        settleCaptures()
+        local shot = shots[integer(args.id)]
+        assert(shot ~= nil, "unknown screenshot: " .. tostring(args.id))
+
+        return shotInfo(shot)
+    end,
+    false,
+    true
+)
+
 local families: {
     [string]: boolean
 } = {
@@ -445,7 +630,9 @@ local families: {
     snapshot = true,
     profile = true,
     systems = true,
-    states = true
+    states = true,
+    clock = true,
+    screenshot = true
 }
 
 local function groupOf(name: string): string
