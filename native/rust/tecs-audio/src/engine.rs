@@ -16,6 +16,7 @@ use crate::device::{self, Output};
 use crate::mixer::Mixer;
 use crate::source::{ResidentSource, Source, MAX_CHANNELS};
 use crate::stream::Feeder;
+use crate::synth::{self, Port, Settings};
 
 /// Measures a clip's duration against the streaming threshold.
 pub const MODE_AUTO: u32 = 0;
@@ -52,6 +53,13 @@ pub struct Loaded {
 pub struct Engine {
     mixer: Arc<Mutex<Mixer>>,
     clips: RwLock<HashMap<u32, Clip>>,
+    /// SoundFonts by the id `load_sound_font` handed out, shared by every
+    /// synthesizer opened on one.
+    fonts: RwLock<HashMap<u32, Arc<rustysynth::SoundFont>>>,
+    next_font: Mutex<u32>,
+    /// Synthesizers opened and not yet started, by the voice handle whose
+    /// `PLAY` will take them.
+    synths: Mutex<HashMap<u32, Box<dyn Source>>>,
     feeder: Feeder,
     output: Option<Output>,
     /// The reason the most recent failing call gave, kept so the binding can
@@ -115,6 +123,9 @@ impl Engine {
             failed,
             mixer,
             clips: RwLock::new(HashMap::new()),
+            fonts: RwLock::new(HashMap::new()),
+            next_font: Mutex::new(0),
+            synths: Mutex::new(HashMap::new()),
             feeder: Feeder::start(),
             output,
             last_error: Mutex::new(reason),
@@ -291,8 +302,67 @@ impl Engine {
         }
     }
 
+    /// Reads a SoundFont and returns the id synthesizers name it by.
+    ///
+    /// @return the id, from one up, or the reason nothing was loaded
+    pub fn load_sound_font(&self, path: &str) -> Result<u32, String> {
+        let font = synth::load_sound_font(path).map_err(|reason| self.fail(reason))?;
+        let id = match self.next_font.lock() {
+            Err(_) => return Err(self.fail("the SoundFont counter is poisoned".to_string())),
+            Ok(mut next) => {
+                *next += 1;
+                *next
+            }
+        };
+        match self.fonts.write() {
+            Err(_) => Err(self.fail("the SoundFont table is poisoned".to_string())),
+            Ok(mut fonts) => {
+                fonts.insert(id, font);
+                Ok(id)
+            }
+        }
+    }
+
+    /// Drops a SoundFont. Synthesizers already opened on it keep their own
+    /// reference and play on.
+    pub fn release_sound_font(&self, font: u32) {
+        if let Ok(mut fonts) = self.fonts.write() {
+            fonts.remove(&font);
+        }
+    }
+
+    /// Creates a synthesizer on a loaded SoundFont and parks its source for the
+    /// `PLAY` carrying `handle` and `FLAG_SYNTH`.
+    ///
+    /// Everything that allocates happens here, on the caller's thread: the
+    /// synthesizer, its voices, its queue and its scratch buffers. The output
+    /// callback only ever renders it.
+    ///
+    /// @return the port events are sent through, or the reason nothing opened
+    pub fn open_synth(&self, font: u32, handle: u32, settings: &Settings) -> Result<Port, String> {
+        let shared = match self.fonts.read() {
+            Err(_) => return Err(self.fail("the SoundFont table is poisoned".to_string())),
+            Ok(fonts) => match fonts.get(&font) {
+                None => return Err(self.fail(format!("no SoundFont is loaded under {font}"))),
+                Some(value) => Arc::clone(value),
+            },
+        };
+        let (port, source) =
+            synth::open(&shared, self.sample_rate, settings).map_err(|reason| self.fail(reason))?;
+        match self.synths.lock() {
+            Err(_) => Err(self.fail("the synthesizer table is poisoned".to_string())),
+            Ok(mut synths) => {
+                synths.insert(handle, Box::new(source));
+                Ok(port)
+            }
+        }
+    }
+
     /// Builds the source a `PLAY` needs, outside the mixer lock.
     fn prepare(&self, command: &Command) -> Option<Box<dyn Source>> {
+        if command.has(command::FLAG_SYNTH) {
+            return self.synths.lock().ok()?.remove(&command.handle);
+        }
         let clips = self.clips.read().ok()?;
         match clips.get(&command.clip)? {
             Clip::Resident {
@@ -404,6 +474,12 @@ impl Engine {
         self.available = false;
         if let Ok(mut clips) = self.clips.write() {
             clips.clear();
+        }
+        if let Ok(mut fonts) = self.fonts.write() {
+            fonts.clear();
+        }
+        if let Ok(mut synths) = self.synths.lock() {
+            synths.clear();
         }
     }
 }

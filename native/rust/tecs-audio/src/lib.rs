@@ -30,6 +30,7 @@ pub mod enumerate;
 pub mod mixer;
 pub mod source;
 pub mod stream;
+pub mod synth;
 
 use std::ffi::{c_char, CStr, CString};
 use std::sync::Mutex;
@@ -38,6 +39,7 @@ use capture::Capture;
 use command::{Command, Event};
 use engine::Engine;
 use enumerate::DeviceList;
+use synth::{Port, Settings};
 
 /// What a call answers when it worked.
 const STATUS_OK: i32 = 0;
@@ -403,6 +405,190 @@ pub unsafe extern "C" fn tecs_audio_render(device: *mut Engine, out: *mut f32, f
     let samples = frames as usize * value.channels() as usize;
     let span = unsafe { std::slice::from_raw_parts_mut(out, samples) };
     value.render(span) as u32
+}
+
+/// Reads a SoundFont 2 file into the device and writes the id it is held under.
+///
+/// # Safety
+///
+/// `path` must be a NUL-terminated string, `font` must be writable, and the
+/// device must be live.
+///
+/// @return zero when the SoundFont loaded, and one with the reason left for
+///     `tecs_audio_last_error` when it did not
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_load_soundfont(
+    device: *mut Engine,
+    path: *const c_char,
+    font: *mut u32,
+) -> i32 {
+    let value = match unsafe { engine(device) } {
+        None => return STATUS_FAILED,
+        Some(value) => value,
+    };
+    if path.is_null() || font.is_null() {
+        return STATUS_FAILED;
+    }
+    let Ok(text) = unsafe { CStr::from_ptr(path) }.to_str() else {
+        return STATUS_FAILED;
+    };
+    match value.load_sound_font(text) {
+        Err(_) => STATUS_FAILED,
+        Ok(id) => {
+            unsafe { *font = id };
+            STATUS_OK
+        }
+    }
+}
+
+/// Drops a SoundFont. Synthesizers already opened on it play on.
+///
+/// # Safety
+///
+/// The pointer must name a live device.
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_release_soundfont(device: *mut Engine, font: u32) {
+    if let Some(value) = unsafe { engine(device) } {
+        value.release_sound_font(font);
+    }
+}
+
+/// Opens a synthesizer on a loaded SoundFont for the voice `handle` names.
+///
+/// The synthesizer starts sounding when a `PLAY` carrying the same handle and
+/// the synth flag reaches `tecs_audio_submit`. Until then events sent to it
+/// wait in its queue and its clock stands at zero.
+///
+/// # Safety
+///
+/// The pointer must name a live device. The returned port is owned by the
+/// caller, outlives the device safely, and is freed by `tecs_audio_synth_close`.
+///
+/// @return the port, or null with the reason left for `tecs_audio_last_error`
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_synth_open(
+    device: *mut Engine,
+    font: u32,
+    handle: u32,
+    polyphony: u32,
+    effects: i32,
+) -> *mut Port {
+    let value = match unsafe { engine(device) } {
+        None => return std::ptr::null_mut(),
+        Some(value) => value,
+    };
+    let settings = Settings {
+        polyphony: polyphony as usize,
+        effects: effects != 0,
+    };
+    match value.open_synth(font, handle, &settings) {
+        Err(_) => std::ptr::null_mut(),
+        Ok(port) => Box::into_raw(Box::new(port)),
+    }
+}
+
+/// Borrows the port a synthesizer pointer names.
+///
+/// # Safety
+///
+/// The pointer must be one `tecs_audio_synth_open` returned and
+/// `tecs_audio_synth_close` has not yet been given.
+unsafe fn port<'a>(synth: *mut Port) -> Option<&'a mut Port> {
+    if synth.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *synth })
+    }
+}
+
+/// Queues a short MIDI message for `at` seconds on the synthesizer clock.
+///
+/// A time of zero or less, or one already rendered, means the next block.
+///
+/// # Safety
+///
+/// The pointer must name a live port.
+///
+/// @return nonzero when the queue took the event, and zero when it was full
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_synth_send(
+    synth: *mut Port,
+    status: u32,
+    data1: u32,
+    data2: u32,
+    at: f64,
+) -> i32 {
+    match unsafe { port(synth) } {
+        None => 0,
+        Some(value) => i32::from(value.send(status as u8, data1 as u8, data2 as u8, at)),
+    }
+}
+
+/// Queues a release of every note on `channel`, or on every channel when it is
+/// negative, for the next block.
+///
+/// # Safety
+///
+/// The pointer must name a live port.
+///
+/// @return nonzero when the queue took the event
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_synth_notes_off(
+    synth: *mut Port,
+    channel: i32,
+    immediate: i32,
+) -> i32 {
+    match unsafe { port(synth) } {
+        None => 0,
+        Some(value) => {
+            let named = u8::try_from(channel).ok();
+            i32::from(value.notes_off(named, immediate != 0))
+        }
+    }
+}
+
+/// Queues a reset to General MIDI defaults for the next block, discarding
+/// every event sent before it that has not been applied.
+///
+/// # Safety
+///
+/// The pointer must name a live port.
+///
+/// @return nonzero when the queue took the event
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_synth_reset(synth: *mut Port) -> i32 {
+    match unsafe { port(synth) } {
+        None => 0,
+        Some(value) => i32::from(value.reset()),
+    }
+}
+
+/// Reports the synthesizer clock: the frames it has rendered over the rate.
+///
+/// # Safety
+///
+/// The pointer must name a live port.
+///
+/// @return seconds, and zero for a null port
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_synth_now(synth: *mut Port) -> f64 {
+    match unsafe { port(synth) } {
+        None => 0.0,
+        Some(value) => value.now(),
+    }
+}
+
+/// Frees a port. The voice it fed is the mixer's to stop, through `STOP`.
+///
+/// # Safety
+///
+/// The pointer must come from `tecs_audio_synth_open` and must not be used
+/// again.
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_synth_close(synth: *mut Port) {
+    if !synth.is_null() {
+        drop(unsafe { Box::from_raw(synth) });
+    }
 }
 
 /// Selects the command struct in `tecs_audio_layout`.
@@ -1015,6 +1201,33 @@ mod tests {
             tecs_audio_submit(null, std::ptr::null(), 0);
             tecs_audio_release_clip(null, 1);
             tecs_audio_close(null);
+        }
+    }
+
+    #[test]
+    fn tolerates_a_null_port_and_refuses_a_synth_on_no_soundfont() {
+        let null: *mut Port = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(tecs_audio_synth_send(null, 0x90, 60, 100, 0.0), 0);
+            assert_eq!(tecs_audio_synth_notes_off(null, -1, 1), 0);
+            assert_eq!(tecs_audio_synth_reset(null), 0);
+            assert_eq!(tecs_audio_synth_now(null), 0.0);
+            tecs_audio_synth_close(null);
+
+            let device = tecs_audio_open_offline(48_000, 2, 8);
+            let port = tecs_audio_synth_open(device, 1, 65_537, 64, 1);
+            assert!(port.is_null(), "no SoundFont is loaded under id 1");
+            assert!(!tecs_audio_last_error(device).is_null());
+
+            let path = CString::new("no/such/font.sf2").expect("the literal has no NUL");
+            let mut font = 0u32;
+            assert_eq!(
+                tecs_audio_load_soundfont(device, path.as_ptr(), &mut font),
+                STATUS_FAILED
+            );
+            assert_eq!(font, 0);
+            tecs_audio_release_soundfont(device, 1);
+            tecs_audio_close(device);
         }
     }
 
