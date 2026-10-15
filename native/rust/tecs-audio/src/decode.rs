@@ -1,9 +1,11 @@
 //! Symphonia-backed audio decoding for the Tecs audio runtime.
 //!
-//! This module turns a file on disk into interleaved f32 samples at the source
-//! layout. It never downmixes and never resamples: the mixer above owns both.
+//! This module turns an encoded file, on disk or held in memory, into
+//! interleaved f32 samples at the source layout. It never downmixes and never
+//! resamples: the mixer above owns both.
 
 use std::fs::File;
+use std::io::Cursor;
 use std::path::Path;
 
 use symphonia::core::audio::GenericAudioBufferRef;
@@ -22,7 +24,7 @@ use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Duration, Time, TimeBase};
 
@@ -77,8 +79,32 @@ pub struct Decoded {
 /// cannot be identified, it carries no audio track, or no linked decoder
 /// handles its codec.
 pub fn decode_all(path: &str) -> Result<Decoded, String> {
-    let mut streamer = Streamer::open(path)?;
+    read_to_end(Streamer::open(path)?)
+}
 
+/// Fully decodes the bytes of a whole encoded file held in memory.
+///
+/// The bytes are what a file on disk would hold, container and all, in any
+/// format a linked decoder reads, so a caller that has raw samples builds the
+/// container itself. `name` stands where a path would: every error names it,
+/// and its extension, when it carries one, hints the probe the way a path's
+/// does. The probe reads the content either way.
+///
+/// The bytes are copied once for the length of the decode, because the reader
+/// takes an owned source, and nothing of them is kept afterwards. Returns an
+/// error naming `name` when the bytes are empty, their container cannot be
+/// identified, they carry no audio track, or no linked decoder handles their
+/// codec.
+pub fn decode_bytes(name: &str, bytes: &[u8]) -> Result<Decoded, String> {
+    if bytes.is_empty() {
+        return Err(format!("tecs-audio: \"{name}\" holds no bytes to decode"));
+    }
+    let reader = probe(name, Box::new(Cursor::new(bytes.to_vec())))?;
+    read_to_end(Streamer::from_reader(name, reader)?)
+}
+
+/// Reads a streamer to its end and returns everything it decoded.
+fn read_to_end(mut streamer: Streamer) -> Result<Decoded, String> {
     let mut samples = Vec::new();
     while streamer.read(&mut samples, usize::MAX)? {}
 
@@ -151,8 +177,14 @@ impl Streamer {
     /// cannot be opened, its container cannot be identified, it carries no audio
     /// track, or no linked decoder handles its codec.
     pub fn open(path: &str) -> Result<Streamer, String> {
-        let reader = open_reader(path)?;
+        Streamer::from_reader(path, open_reader(path)?)
+    }
 
+    /// Builds a streamer over a reader whose container is already identified.
+    ///
+    /// `path` labels every error the streamer reports, and is the name a
+    /// memory input was given when there is no path.
+    fn from_reader(path: &str, reader: Box<dyn FormatReader>) -> Result<Streamer, String> {
         let track = reader
             .default_track(TrackType::Audio)
             .ok_or_else(|| no_audio_track(path))?;
@@ -390,10 +422,19 @@ fn open_reader(path: &str) -> Result<Box<dyn FormatReader>, String> {
     let file =
         File::open(path).map_err(|err| format!("tecs-audio: failed to open \"{path}\": {err}"))?;
 
-    let source = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    probe(path, Box::new(file))
+}
+
+/// Identifies the container format of an opened input.
+///
+/// Passes the extension of `label`, a path or a memory input's name, to the
+/// probe as a hint when it carries a usable one, and probes on content alone
+/// otherwise.
+fn probe(label: &str, input: Box<dyn MediaSource>) -> Result<Box<dyn FormatReader>, String> {
+    let source = MediaSourceStream::new(input, MediaSourceStreamOptions::default());
 
     let mut hint = Hint::new();
-    if let Some(extension) = Path::new(path).extension().and_then(|ext| ext.to_str()) {
+    if let Some(extension) = Path::new(label).extension().and_then(|ext| ext.to_str()) {
         if !extension.is_empty() {
             hint.with_extension(extension);
         }
@@ -406,7 +447,7 @@ fn open_reader(path: &str) -> Result<Box<dyn FormatReader>, String> {
             FormatOptions::default(),
             MetadataOptions::default(),
         )
-        .map_err(|err| format!("tecs-audio: failed to identify the format of \"{path}\": {err}"))
+        .map_err(|err| format!("tecs-audio: failed to identify the format of \"{label}\": {err}"))
 }
 
 /// Converts a container-stated duration into seconds.
@@ -774,6 +815,80 @@ mod tests {
 
         let error = expect_error(result, "a text file decoded as audio");
         assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn decode_bytes_matches_decoding_the_same_file_sample_for_sample() {
+        let expected = stereo_tone(4800);
+        let wav = TempWav::write(&expected, 44_100, 2, false);
+        let bytes = fs::read(&wav.path).expect("the generated WAV reads back");
+
+        let from_file = decode_all(wav.as_str()).expect("the generated WAV decodes");
+        let from_memory =
+            decode_bytes("music/tone.wav", &bytes).expect("the same bytes decode from memory");
+
+        assert_eq!(from_memory.sample_rate, from_file.sample_rate);
+        assert_eq!(from_memory.channels, from_file.channels);
+        assert_eq!(from_memory.samples, from_file.samples);
+    }
+
+    #[test]
+    fn decode_bytes_reads_a_name_with_no_extension_by_content() {
+        let expected = stereo_tone(480);
+        let bytes = encode_wav(&expected, 48_000, 2, true);
+
+        let decoded = decode_bytes("generated tone", &bytes).expect("the probe reads the content");
+
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.samples, expected);
+    }
+
+    #[test]
+    fn decode_bytes_reads_a_mono_8_bit_unsigned_wav_built_by_hand() {
+        // RIFF/WAVE, format tag 1 (PCM), one channel, 11025 Hz, 8 bits, five
+        // frames. Unsigned 8-bit PCM centres on 128, so these five bytes are
+        // the bottom of the range, halfway down, silence, halfway up and the
+        // top of the range.
+        let data: [u8; 5] = [0, 64, 128, 192, 255];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36u32 + data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&11_025u32.to_le_bytes());
+        bytes.extend_from_slice(&11_025u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&data);
+
+        let decoded = decode_bytes("SOUND.BIN", &bytes).expect("the hand-built WAV decodes");
+
+        assert_eq!(decoded.sample_rate, 11_025);
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.samples, vec![-1.0, -0.5, 0.0, 0.5, 127.0 / 128.0]);
+    }
+
+    #[test]
+    fn decode_bytes_reports_bytes_that_are_not_audio_by_name() {
+        let error = expect_error(
+            decode_bytes("junk.wav", b"these bytes are not audio at all"),
+            "text decoded as audio",
+        );
+        assert!(
+            error.contains("junk.wav"),
+            "the error does not name the input: {error}"
+        );
+
+        let error = expect_error(decode_bytes("empty.wav", &[]), "no bytes decoded");
+        assert!(
+            error.contains("empty.wav") && error.contains("no bytes"),
+            "the error does not say the input was empty: {error}"
+        );
     }
 
     #[test]

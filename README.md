@@ -57,6 +57,8 @@ test suite reach the same world without starting a graphics stack.
   layers, object factories, runtime tile edits and authored collision outlines.
 - [Retained UI backed by Taffy](docs/ui/index.md), intrinsic text and images,
   scrolling, clipping, pointer capture, keyboard focus and controller activation.
+- Audio clips decoded from a file or from the bytes of a whole encoded file held
+  in memory, for a game that unpacks its own archives.
 
 The 2D shape materials include rectangles, circles, rings, rounded rectangles,
 triangles and stars. 3D rendering, custom post-processing and multi-camera
@@ -464,6 +466,22 @@ mid-playback, and its seek blocks the caller. Both own their own device and
 decode graph, so adapting either meant writing custom sources anyway and taking
 the dependency. What remained was roughly 450 lines: resampling, a gain
 envelope, a speaker pair, and a loop wrap.
+
+A clip from memory is the bytes of a whole encoded file, container and all,
+rather than raw samples. `loadBytes` hands them to the same `symphonia` probe a
+file goes through, so every format `load` reads from disk reads from memory too,
+and there is one decode path rather than two. The alternative was a
+`loadSamples` taking floats with a rate and a channel count, and it lost on
+three counts: it needs a sample-format vocabulary (width, signedness, endianness,
+interleaving) that a WAV header already is, it copies a Nupp table across the
+seam one float at a time where a string crosses as one pointer and a length,
+and a game format that is not raw PCM would still need the decoders anyway. A
+game holding raw samples writes the 44-byte header itself, which is the cost
+this pushes onto it. The clip is always resident, because streaming would mean
+Rust keeping the bytes alive for every voice; the bytes are copied once for the
+decode and dropped. Its name shares the clip namespace with paths, because a
+`Sound` row and a snapshot carry a clip as a string, and so `reload` reports
+false for it rather than having a file to re-read.
 
 The capture buffer is bounded rather than growing without limit as the SDL
 stream did. It holds one second by default, drops the oldest, and reports the

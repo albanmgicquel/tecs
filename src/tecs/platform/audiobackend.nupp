@@ -131,6 +131,16 @@ export record Backend
     --- load settled on, or nil and a reason.
     loadClip: function(path: string, clip: integer, mode: LoadMode, streamSeconds: number): (ClipInfo?, string?)
 
+    --- Read-only. Decodes `bytes`, the whole of an encoded file held in memory,
+    --- container and all, and holds the result under `clip`, returning what the
+    --- load settled on, or nil and a reason. The result is always resident,
+    --- because there is no file for a voice to stream from. `name` stands where
+    --- a path would: a reason names it, and its extension may hint the format.
+    --- The bytes are borrowed for the call and not kept. Omitted by a backend
+    --- that cannot decode from memory, which `tecs.audio` answers with a
+    --- reason rather than a raise.
+    loadClipBytes: (function(name: string, bytes: string, clip: integer): (ClipInfo?, string?))?
+
     --- Read-only. Drops whatever a clip index holds. Voices already reading it
     --- finish on the samples they started with.
     releaseClip: function(clip: integer): nil
@@ -354,6 +364,9 @@ export function silent(): Backend
             _mode: LoadMode,
             _streamSeconds: number
         ): (ClipInfo?, string?)
+            return new ClipInfo(duration = 0, resident = false)
+        end,
+        loadClipBytes = function(_name: string, _bytes: string, _clip: integer): (ClipInfo?, string?)
             return new ClipInfo(duration = 0, resident = false)
         end,
         releaseClip = function(_clip: integer): nil

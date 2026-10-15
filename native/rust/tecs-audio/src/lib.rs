@@ -287,6 +287,59 @@ pub unsafe extern "C" fn tecs_audio_load_clip(
     }
 }
 
+/// Decodes the bytes of a whole encoded file held in memory and holds the
+/// result under `clip`, always resident.
+///
+/// `name` stands where a path would for `tecs_audio_load_clip`: every reason
+/// names it, and its extension hints the probe. The bytes are borrowed for the
+/// call only and nothing of them is kept.
+///
+/// # Safety
+///
+/// `name` must be a NUL-terminated string, `bytes` must address `length`
+/// readable bytes when `length` is nonzero, `info` must be writable, and the
+/// device must be live.
+///
+/// @return zero when the clip loaded, and one with the reason left for
+///     `tecs_audio_last_error` when it did not
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_load_clip_bytes(
+    device: *mut Engine,
+    name: *const c_char,
+    bytes: *const u8,
+    length: u64,
+    clip: u32,
+    info: *mut ClipInfo,
+) -> i32 {
+    let value = match unsafe { engine(device) } {
+        None => return STATUS_FAILED,
+        Some(value) => value,
+    };
+    if name.is_null() || info.is_null() {
+        return STATUS_FAILED;
+    }
+    let text = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Err(_) => return STATUS_FAILED,
+        Ok(text) => text,
+    };
+    let span: &[u8] = if bytes.is_null() || length == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees this readable range for the call.
+        unsafe { std::slice::from_raw_parts(bytes, length as usize) }
+    };
+    match value.load_clip_bytes(text, span, clip) {
+        Err(_) => STATUS_FAILED,
+        Ok(loaded) => {
+            unsafe {
+                (*info).duration = loaded.duration as f32;
+                (*info).resident = i32::from(loaded.resident);
+            }
+            STATUS_OK
+        }
+    }
+}
+
 /// Drops whatever a clip index holds.
 ///
 /// # Safety
@@ -873,6 +926,76 @@ mod tests {
             let reason = tecs_audio_last_error(device);
             assert!(!reason.is_null());
             assert!(!CStr::from_ptr(reason).to_bytes().is_empty());
+            tecs_audio_close(device);
+        }
+    }
+
+    #[test]
+    fn crosses_a_clip_held_in_memory_and_reports_one_that_is_not_audio() {
+        let device = tecs_audio_open_offline(48_000, 2, 8);
+        let name = CString::new("sound.wav").expect("the literal has no NUL");
+        let mut info = ClipInfo {
+            duration: 0.0,
+            resident: 0,
+        };
+        // A mono 8-bit WAV of 4800 frames at 48 kHz: a tenth of a second.
+        let frames: u32 = 4_800;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + frames).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&frames.to_le_bytes());
+        bytes.resize(bytes.len() + frames as usize, 128);
+        unsafe {
+            let status = tecs_audio_load_clip_bytes(
+                device,
+                name.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len() as u64,
+                1,
+                &mut info,
+            );
+            assert_eq!(status, STATUS_OK);
+            assert_eq!(info.resident, 1);
+            assert!((info.duration - 0.1).abs() < 1.0e-6);
+
+            let junk = b"not audio";
+            let status = tecs_audio_load_clip_bytes(
+                device,
+                name.as_ptr(),
+                junk.as_ptr(),
+                junk.len() as u64,
+                2,
+                &mut info,
+            );
+            assert_eq!(status, STATUS_FAILED);
+            let reason = CStr::from_ptr(tecs_audio_last_error(device))
+                .to_str()
+                .expect("the reason is UTF-8");
+            assert!(reason.contains("sound.wav"), "got {reason}");
+
+            let status = tecs_audio_load_clip_bytes(
+                device,
+                name.as_ptr(),
+                std::ptr::null(),
+                0,
+                3,
+                &mut info,
+            );
+            assert_eq!(status, STATUS_FAILED);
+
+            let null: *mut Engine = std::ptr::null_mut();
+            let status =
+                tecs_audio_load_clip_bytes(null, name.as_ptr(), bytes.as_ptr(), 1, 4, &mut info);
+            assert_eq!(status, STATUS_FAILED);
             tecs_audio_close(device);
         }
     }

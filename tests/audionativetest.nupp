@@ -76,6 +76,61 @@ function suite.reportsAMissingFileWithTheLibraryReason(): nil
     backend.close()
 end
 
+--- Returns `value` as `width` little-endian bytes.
+local function littleEndian(value: integer, width: integer): string
+    local bytes: {string} = {}
+    local rest = value
+    for index = 1, width do
+        bytes[index] = string.char(rest % 256)
+        rest = rest // 256
+    end
+
+    return table.concat(bytes)
+end
+
+--- Builds a mono 8-bit unsigned WAV holding `data`, padded to an even chunk.
+local function unsignedWav(rate: integer, data: string): string
+    local pad = #data % 2 == 1 and "\0" or ""
+    local format = "fmt " .. littleEndian(
+        16,
+        4
+    ) .. littleEndian(
+        1,
+        2
+    ) .. littleEndian(
+        1,
+        2
+    ) .. littleEndian(rate, 4) .. littleEndian(rate, 4) .. littleEndian(1, 2) .. littleEndian(8, 2)
+    local chunk = "data" .. littleEndian(#data, 4) .. data .. pad
+
+    return "RIFF" .. littleEndian(4 + #format + #chunk, 4) .. "WAVE" .. format .. chunk
+end
+
+function suite.decodesAClipFromBytesThroughTheLibrary(): nil
+    local backend = opened()
+    -- 1099 frames at 10989 Hz, an odd chunk with its pad byte, of silence,
+    -- which unsigned 8-bit PCM writes as 128.
+    local bytes = unsignedWav(10989, string.rep(string.char(128), 1099))
+    local seconds = 1099 / 10989
+    local info, reason = assert(backend.loadClipBytes)("SOUND.WAV", bytes, 1)
+    test.equal(reason, nil)
+    test.assert(assert(info).resident)
+    test.assert(math.abs(assert(info).duration - seconds) < 1e-6)
+
+    local mixer = audio.newAudio({backend = backend})
+    local clip = assert(mixer:loadBytes("tests/memory/silence.wav", bytes))
+    test.assert(clip.memory and clip.resident)
+    test.assert(math.abs(clip.duration - seconds) < 1e-6)
+    -- The offline backend reports no output, so nothing starts; the clip is
+    -- what was under test.
+    test.equal(mixer:play(clip), 0)
+
+    local junk, junkReason = mixer:loadBytes("tests/memory/junk.wav", "these bytes are not audio")
+    test.equal(junk, nil)
+    test.matches(assert(junkReason), "junk.wav")
+    mixer:destroy()
+end
+
 function suite.namesTheDecodersTheLibraryLinked(): nil
     local backend = opened()
     test.assert(#backend.decoders() > 0)
