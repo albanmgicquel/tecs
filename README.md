@@ -406,6 +406,60 @@ fixed. Physics history stores the creation pose before the first solver result,
 then snapshots before later fixed steps, keeping rendering between two real
 simulation poses without changing either.
 
+### The windowed frame loop on macOS
+
+The window host used to poll: `ControlFlow::Poll`, with the whole frame in
+`about_to_wait`. Under FIFO presentation that frame spends most of its time in
+`get_current_texture`, which on Metal is `nextDrawable` waiting for the next
+vsync, on the main thread. Measured on a game, the main thread was blocked
+there for 90 percent of the run, and it showed up somewhere nobody looks: with
+Magnet running, every click and the start of every title-bar drag waited about
+half a second, less on a 120 Hz display, while the host's own logs showed
+frames every 16.7 ms and input delivered within a millisecond.
+
+The delay sits in front of the process. Window managers such as Magnet and
+BetterTouchTool (its snap areas) install an event tap that filters mouse-down
+events, and before letting a click through they ask the clicked application
+about its window over Accessibility. That request is a message on the main run
+loop, which a polled loop serves one per turn, and every turn is a frame
+blocked until vsync, so a few dozen requests cost a few dozen frames. The
+press and release then reach the window together, a few milliseconds apart.
+winit#1737 is the same report from other engines and apps, and Godot ships a
+workaround that detects Magnet by its bundle identifier.
+
+The host now paces the windowed frame on macOS instead (`pacing` in the
+winit host). The event loop sleeps in `WaitUntil` until a frame is due, one
+monitor refresh after the last; the frame is requested with `request_redraw`
+and runs in `RedrawRequested`; and a worker thread acquires each drawable as
+soon as the previous frame is presented, so a due frame whose drawable is not
+in hand yet is put off and checked again every millisecond rather than waited
+for. Between frames the run loop is asleep in the kernel, where an
+Accessibility request wakes it at once. Pacing alone was not enough: a timer
+deadline does not stay in phase with vsync, so with every drawable queued the
+acquire still blocked for the phase difference, up to a whole frame, and clicks
+were still held for up to a hundred milliseconds. With the frame gated on a
+free drawable, measured with a diagnostic build that counted presented
+drawables, the share of the run spent blocked fell to nothing and the oldest
+click on arrival to about 16 ms, the tap's own cost.
+
+The alternatives that lost: a `CADisplayLink` driving the frame paced well but
+still blocked in acquire without the gate, and with it was no better than the
+timer while adding a macOS 14 dependency; one frame of latency instead of two
+halved the frame rate, because a single queued drawable is not released before
+the next frame wants it; and counting presented drawables needs a handler on
+the `CAMetalDrawable`, which wgpu does not expose, so it meant patching
+wgpu-hal. Acquiring on a worker uses only wgpu's public API (`Surface` and
+`SurfaceTexture` are `Send` and `Sync`) and answers exactly the question the
+gate asks. One consequence to know: wgpu-hal's Metal acquire reads the hosting
+`NSWindow`'s `occlusionState` to skip occluded windows, and that read now
+happens on the worker. A reconfigure first waits for the acquisition in flight
+and drops what it acquired, since a surface is not configured with a texture
+outstanding. A frame put off for 100 ms runs anyway and waits for its drawable
+as before, so a surface that stops answering cannot stop the game. Other
+platforms keep the polled loop: nothing there has shown the failure, and the
+render benchmark's interactive view keeps it too, since it measures uncapped
+presentation.
+
 ## Platform services this tree does not carry
 
 Three services the SDL implementation shipped are settled differently here, and

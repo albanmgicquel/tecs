@@ -26,6 +26,10 @@ supported. Otherwise they use nonblocking `Mailbox` presentation, which can
 render faster than the display. A surface supporting only synchronized FIFO
 presentation is rejected. The host prints the chosen mode.
 
+The interactive view also keeps the host's polled frame loop on every platform.
+An ordinary window on macOS is paced to the display instead, one frame per
+refresh, so its frame rate is the display's.
+
 The interactive frame rate includes window presentation and excludes initial
 scene setup. It counts submitted frames and uses elapsed wall time, including
 the cost of its statistics. It does not write a timing report. Use the fixed

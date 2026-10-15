@@ -8,6 +8,7 @@ mod graph;
 mod graphics;
 #[cfg(test)]
 mod lightingtests;
+mod pacing;
 mod packet;
 #[cfg(test)]
 mod pipelinetests;
@@ -74,6 +75,11 @@ struct App {
     shutdown: bool,
     failure: Option<String>,
     frame_parked: bool,
+    /// Paces the windowed frame on macOS (see `pacing`); `None` polls, with the
+    /// frame in `about_to_wait`.
+    pacer: Option<pacing::FramePacer>,
+    /// Frames until the refresh period is read from the monitor again.
+    refresh_check: u32,
     stats_started: Option<Instant>,
     stats_frames: u32,
     pending_captures: Vec<u64>,
@@ -95,6 +101,7 @@ impl App {
         })?;
         bridge.init().context("initialize the Tecs application")?;
         let now = Instant::now();
+        let pacer = paced_frame_loop(&config).then(|| pacing::FramePacer::new(now));
         Ok(Self {
             bridge,
             config,
@@ -111,6 +118,8 @@ impl App {
             shutdown: false,
             failure: None,
             frame_parked: false,
+            pacer,
+            refresh_check: 0,
             stats_started: None,
             stats_frames: 0,
             pending_captures: Vec::new(),
@@ -172,6 +181,7 @@ impl App {
             Arc::clone(&window),
             event_loop.owned_display_handle(),
             self.config.benchmark_view,
+            self.pacer.is_some(),
         )?;
         self.bridge.attach_window(&state)?;
         self.window_id = Some(window.id());
@@ -367,6 +377,44 @@ impl App {
         Ok(())
     }
 
+    /// Runs one paced frame (see `pacing`), from the `RedrawRequested` the pacer
+    /// asked for, or from one AppKit sent on its own (a live resize) when a
+    /// drawable is free. One AppKit sent while every drawable is taken is left
+    /// to the next due frame, which is at most a period away.
+    fn paced_frame(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(pacer) = self.pacer.as_ref() else {
+            return;
+        };
+        if !pacer.redraw_requested() && !self.graphics.as_mut().is_none_or(Graphics::drawable_ready)
+        {
+            return;
+        }
+        if self.refresh_check == 0 {
+            self.refresh_check = 60;
+            let rate = self
+                .window
+                .as_ref()
+                .and_then(|window| window.current_monitor())
+                .and_then(|monitor| monitor.refresh_rate_millihertz());
+            if let Some(pacer) = self.pacer.as_mut() {
+                pacer.set_refresh_millihertz(rate);
+            }
+        }
+        self.refresh_check -= 1;
+        let now = Instant::now();
+        if let Some(pacer) = self.pacer.as_mut() {
+            pacer.frame_started(now);
+        }
+        if let Err(error) = self.tick(event_loop) {
+            self.fail(event_loop, error);
+        }
+        if self.frame_parked {
+            if let Some(pacer) = self.pacer.as_mut() {
+                pacer.retry_soon(Instant::now());
+            }
+        }
+    }
+
     fn tick(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         if self.shutdown || event_loop.exiting() {
             return Ok(());
@@ -498,6 +546,10 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         if self.shutdown || event_loop.exiting() || Some(window_id) != self.window_id {
+            return;
+        }
+        if matches!(event, WindowEvent::RedrawRequested) && self.pacer.is_some() {
+            self.paced_frame(event_loop);
             return;
         }
         let result = match event {
@@ -666,8 +718,32 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Err(error) = self.tick(event_loop) {
-            self.fail(event_loop, error);
+        if self.pacer.is_none() {
+            if let Err(error) = self.tick(event_loop) {
+                self.fail(event_loop, error);
+            }
+            return;
+        }
+        let ready = self.graphics.as_mut().is_none_or(Graphics::drawable_ready);
+        let Some(pacer) = self.pacer.as_mut() else {
+            return;
+        };
+        let flow = match pacer.step(Instant::now(), ready) {
+            pacing::Step::Redraw => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                    ControlFlow::Wait
+                } else {
+                    // No window to redraw: the frame runs here.
+                    self.paced_frame(event_loop);
+                    ControlFlow::Poll
+                }
+            }
+            pacing::Step::WaitUntil(instant) => ControlFlow::WaitUntil(instant),
+            pacing::Step::Wait => ControlFlow::Wait,
+        };
+        if !event_loop.exiting() {
+            event_loop.set_control_flow(flow);
         }
     }
 
@@ -932,6 +1008,7 @@ fn run() -> Result<()> {
         return run_headless(config);
     }
     let event_loop = EventLoop::new().context("create the winit event loop")?;
+    // A paced loop sets its own control flow in `about_to_wait`.
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(config)?;
     event_loop
@@ -941,6 +1018,17 @@ fn run() -> Result<()> {
         return Err(anyhow!(failure.clone()));
     }
     Ok(())
+}
+
+/// Whether the window's frame is paced by `pacing` rather than polled.
+///
+/// On macOS the polled loop spends most of each frame blocked on a drawable on
+/// the main thread, which delays every click by as many frames as a window
+/// manager's event tap makes Accessibility requests (see `pacing`). Elsewhere the
+/// polled loop stays: nothing there has shown the same failure. The render
+/// benchmark's view measures uncapped frame rates and polls everywhere.
+fn paced_frame_loop(config: &Config) -> bool {
+    cfg!(target_os = "macos") && !config.benchmark_view
 }
 
 /// Assembles the material dispatch into a shader pack a release loads.
