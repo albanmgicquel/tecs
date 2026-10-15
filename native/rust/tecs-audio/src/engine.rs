@@ -201,24 +201,7 @@ impl Engine {
 
         let entry = if resident {
             let decoded = decode::decode_all(path).map_err(|reason| self.fail(reason))?;
-            if decoded.channels == 0 || decoded.channels as usize > MAX_CHANNELS {
-                return Err(self.fail(format!(
-                    "'{path}' has {} channels, and the mixer carries at most {MAX_CHANNELS}",
-                    decoded.channels
-                )));
-            }
-            let frames = decoded.samples.len() / decoded.channels.max(1) as usize;
-            let seconds = if decoded.sample_rate == 0 {
-                0.0
-            } else {
-                frames as f64 / decoded.sample_rate as f64
-            };
-            Clip::Resident {
-                samples: decoded.samples.into(),
-                channels: decoded.channels,
-                sample_rate: decoded.sample_rate,
-                duration: seconds,
-            }
+            self.resident(path, decoded)?
         } else {
             // Opened and dropped, so a path that cannot be read fails here
             // rather than silently producing a voice that never sounds.
@@ -235,6 +218,50 @@ impl Engine {
             }
         };
 
+        self.hold(clip, entry)
+    }
+
+    /// Decodes the bytes of a whole encoded file held in memory and holds the
+    /// result under `clip`.
+    ///
+    /// A clip from memory is always resident: there is no file for a voice to
+    /// stream from, and the bytes are not kept. `name` stands where a path
+    /// would, in every reason this reports and as the extension the probe is
+    /// hinted with.
+    ///
+    /// @return what the load settled on, or the reason nothing was loaded
+    pub fn load_clip_bytes(&self, name: &str, bytes: &[u8], clip: u32) -> Result<Loaded, String> {
+        let decoded = decode::decode_bytes(name, bytes).map_err(|reason| self.fail(reason))?;
+        let entry = self.resident(name, decoded)?;
+        self.hold(clip, entry)
+    }
+
+    /// Turns decoded samples into a resident clip, refusing a channel count the
+    /// mixer cannot carry.
+    fn resident(&self, label: &str, decoded: decode::Decoded) -> Result<Clip, String> {
+        if decoded.channels == 0 || decoded.channels as usize > MAX_CHANNELS {
+            return Err(self.fail(format!(
+                "'{label}' has {} channels, and the mixer carries at most {MAX_CHANNELS}",
+                decoded.channels
+            )));
+        }
+        let frames = decoded.samples.len() / decoded.channels.max(1) as usize;
+        let seconds = if decoded.sample_rate == 0 {
+            0.0
+        } else {
+            frames as f64 / decoded.sample_rate as f64
+        };
+        Ok(Clip::Resident {
+            samples: decoded.samples.into(),
+            channels: decoded.channels,
+            sample_rate: decoded.sample_rate,
+            duration: seconds,
+        })
+    }
+
+    /// Puts a clip under its index, replacing whatever the index held, and
+    /// reports what it settled on.
+    fn hold(&self, clip: u32, entry: Clip) -> Result<Loaded, String> {
         let settled = match &entry {
             Clip::Resident { duration, .. } => Loaded {
                 duration: *duration,
@@ -432,6 +459,130 @@ mod tests {
         let failure = engine.load_clip("this/file/does/not/exist.ogg", 1, MODE_AUTO, 10.0);
         assert!(failure.is_err());
         assert!(!engine.last_error().is_empty());
+    }
+
+    #[test]
+    fn plays_a_clip_decoded_from_memory_like_one_read_from_a_file() {
+        // One second of mono 16-bit PCM at the engine's own rate, a constant
+        // half-scale level, so the render needs no resampling to compare.
+        let frames: u32 = 48_000;
+        let level: i16 = 16_384;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&96_000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(frames * 2).to_le_bytes());
+        for _ in 0..frames {
+            bytes.extend_from_slice(&level.to_le_bytes());
+        }
+
+        let engine = Engine::open_offline(48_000, 2, 8);
+        let loaded = engine
+            .load_clip_bytes("level.wav", &bytes, 3)
+            .expect("the bytes decode");
+        assert!(loaded.resident);
+        assert!((loaded.duration - 1.0).abs() < 1.0e-9);
+
+        engine.submit(&[play(65_537, 3)]);
+        assert_eq!(engine.voice_count(), 1);
+        let mut out = vec![0.0f32; 2 * 256];
+        assert_eq!(engine.render(&mut out), 256);
+        assert!(
+            out.iter().skip(64).any(|value| *value != 0.0),
+            "a voice on a memory clip renders silence"
+        );
+    }
+
+    /// Builds a mono 8-bit unsigned WAV whose data chunk has an odd length and
+    /// so carries the RIFF pad byte after it.
+    fn odd_unsigned_wav(rate: u32, data: &[u8]) -> Vec<u8> {
+        assert!(data.len() % 2 == 1, "the case under test is an odd chunk");
+        let padded = data.len() as u32 + 1;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + padded).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        // The chunk size states the data alone; the pad byte is not counted.
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(data);
+        bytes.push(0);
+        bytes
+    }
+
+    #[test]
+    fn resamples_an_odd_8_bit_clip_at_a_nonstandard_rate_from_memory() {
+        // A ramp, because linear interpolation reproduces a ramp exactly, so
+        // every resampled frame has a value to be checked against.
+        let data: Vec<u8> = (0..201u32).map(|index| 28 + index as u8).collect();
+        let source_value = |position: f64| (28.0 + position) / 128.0 - 1.0;
+
+        for rate in [10_989u32, 18_868] {
+            let bytes = odd_unsigned_wav(rate, &data);
+
+            let decoded = decode::decode_bytes("SOUND.WAV", &bytes).expect("the WAV decodes");
+            assert_eq!(decoded.sample_rate, rate);
+            assert_eq!(decoded.channels, 1);
+            // The pad byte is not a sample.
+            assert_eq!(decoded.samples.len(), data.len());
+            for (index, sample) in decoded.samples.iter().enumerate() {
+                assert_eq!(*sample, data[index] as f32 / 128.0 - 1.0);
+            }
+
+            let engine = Engine::open_offline(48_000, 2, 8);
+            let loaded = engine
+                .load_clip_bytes("SOUND.WAV", &bytes, 1)
+                .expect("the clip loads");
+            assert!(loaded.resident);
+            assert!((loaded.duration - data.len() as f64 / rate as f64).abs() < 1.0e-12);
+
+            engine.submit(&[play(65_537, 1)]);
+            let mut out = vec![0.0f32; 2 * 4096];
+            engine.render(&mut out);
+            assert_eq!(engine.voice_count(), 0, "the clip outlasted 4096 frames");
+
+            // Output frame k reads source position k * rate / 48000, up to the
+            // last pair of source frames the interpolator can blend.
+            let step = rate as f64 / 48_000.0;
+            let sounded = ((data.len() - 1) as f64 / step).ceil() as usize;
+            for frame in 0..sounded {
+                let want = source_value(frame as f64 * step) as f32;
+                assert!(
+                    (out[frame * 2] - want).abs() < 1.0e-4 && out[frame * 2 + 1] == out[frame * 2],
+                    "frame {frame} at {rate} Hz rendered {}, expected {want}",
+                    out[frame * 2]
+                );
+            }
+            assert!(
+                out[(sounded + 1) * 2..].iter().all(|value| *value == 0.0),
+                "the voice at {rate} Hz sounded past its {sounded} resampled frames"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_bytes_that_are_not_audio_and_keeps_the_index_empty() {
+        let engine = Engine::open_offline(48_000, 2, 8);
+        let failure = engine.load_clip_bytes("junk.ogg", b"not audio", 4);
+        assert!(failure.is_err());
+        assert!(engine.last_error().contains("junk.ogg"));
+        engine.submit(&[play(65_537, 4)]);
+        assert_eq!(engine.voice_count(), 0);
     }
 
     #[test]

@@ -115,6 +115,18 @@ cdef function tecs_audio_load_clip(
     borrows info: tecsAudioClipInfo*
 ): int32
 
+-- The bytes cross as a pointer and a length rather than as a C string: an
+-- encoded file is full of zeroes, so its length cannot come from a terminator.
+
+cdef function tecs_audio_load_clip_bytes(
+    borrows device: voidptr?,
+    name: cstring,
+    borrows bytes: cstring,
+    length: uint64,
+    clip: uint32,
+    borrows info: tecsAudioClipInfo*
+): int32
+
 cdef function tecs_audio_release_clip(borrows device: voidptr?, clip: uint32)
 
 cdef function tecs_audio_position(borrows device: voidptr?, handle: uint32): float
@@ -343,6 +355,18 @@ local function wrap(openDevice: function(): voidptr?, absent: string): (audiobac
         return written
     end
 
+    local function loadClipBytes(name: string, bytes: string, clip: integer): (audiobackend.ClipInfo?, string?)
+        if closed[1] then
+            return nil, "the audio output is closed"
+        end
+        local status = tecs_audio_load_clip_bytes(device, name, bytes, #bytes as uint64, clip as uint32, info)
+        if status ~= 0 then
+            return nil, reason("tecsaudio could not decode the bytes of '" .. name .. "'")
+        end
+
+        return new audiobackend.ClipInfo(duration = info.duration as number, resident = info.resident ~= 0)
+    end
+
     local function loadClip(
         path: string,
         clip: integer,
@@ -377,6 +401,7 @@ local function wrap(openDevice: function(): voidptr?, absent: string): (audiobac
         submit = submit,
         drain = drain,
         loadClip = loadClip,
+        loadClipBytes = loadClipBytes,
         releaseClip = function(clip: integer): nil
             tecs_audio_release_clip(device, clip as uint32)
         end,

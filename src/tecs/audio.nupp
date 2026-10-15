@@ -28,6 +28,25 @@ if voice ~= 0 then
 end
 ```
 
+## Clips from memory
+
+`loadBytes` decodes a clip from the bytes of a whole encoded file a game already
+holds, in any format `load` reads from disk. A game that unpacks its own
+archives hands over each file as it found it; one that holds raw samples puts a
+container around them first, which for PCM is a 44-byte WAV header.
+
+```nupp
+local bytes <const> = assert(nupp.io.files.read("assets/sounds.pak")):sub(1025, 9216)
+local chime <const> = assert(mixer:loadBytes("sounds.pak/chime.wav", bytes))
+mixer:play(chime)
+```
+
+The name is the clip's identity exactly as a path is for `load`, and the two
+share one namespace: a [`Sound`](tecs.audio.Sound) row and a snapshot carry the
+name, and loading it again returns the clip already held. A memory clip is
+always resident and keeps no copy of the bytes, so it has no file for `reload`
+to re-read; a game that wants new bytes loads them under a new name.
+
 Units, in one place, because none of them is in a signature. Time is seconds
 everywhere on this surface: a fade, a seek, a loop point, a cooldown, a clip's
 duration. Every fade is a duration to run for rather than a moment to finish
@@ -463,10 +482,12 @@ export type Config = {
     backend: audiobackend.Backend?
 }
 
---- Configures `Audio.load`.
+--- Configures `Audio.load` and `Audio.loadBytes`.
 export type LoadOptions = {
     --- Caller-writable. Forces streaming when true and residency when false.
     --- Left unset, the clip's duration decides against `streamSeconds`.
+    --- `loadBytes` raises on true, because a clip from memory has no file to
+    --- stream from, and is resident either way.
     stream: boolean?
 }
 
@@ -550,8 +571,9 @@ export type Limit = {
 
 --- Reports one shared playable sound after its load.
 export record Clip
-    --- Read-only. Reports the path the clip was loaded from, exactly as given.
-    --- This is a clip's identity, so two spellings of one file are two clips.
+    --- Read-only. Reports the path the clip was loaded from, or the name
+    --- `loadBytes` was given, exactly as given. This is a clip's identity, so
+    --- two spellings of one file are two clips.
     path: string
 
     --- Read-only. Reports the index a [`Sound`](tecs.audio.Sound) carries.
@@ -574,6 +596,11 @@ export record Clip
     --- Read-only. Reports whether decoded audio stays in memory. False
     --- identifies a clip each voice reads from the file for itself.
     resident: boolean
+
+    --- Read-only. Reports whether the clip was decoded from bytes `loadBytes`
+    --- was given rather than read from a file. Such a clip has no file, so
+    --- `reload` reports false for it.
+    memory: boolean
 end
 
 --- Describes one sounding voice for inspection.
@@ -794,6 +821,7 @@ export record Audio
     destroy: function(exclusive self: Audio): nil
     decoders: function(borrows self: Audio): {string}
     load: function(exclusive self: Audio, path: string, options: LoadOptions?): (Clip?, string?)
+    loadBytes: function(exclusive self: Audio, name: string, bytes: string, options: LoadOptions?): (Clip?, string?)
     clip: function(borrows self: Audio, id: integer): Clip?
     clips: function(borrows self: Audio): {Clip}
     reload: function(exclusive self: Audio, path: string): (boolean, string?)
@@ -1349,7 +1377,15 @@ function Audio.load(exclusive self: Audio, path: string, options: LoadOptions?):
         local reason = failure or ("cannot load " .. path)
         self.clipsById[
             id
-        ] = new Clip(path = path, id = id, status = "failed", error = reason, duration = 0, resident = false)
+        ] = new Clip(
+            path = path,
+            id = id,
+            status = "failed",
+            error = reason,
+            duration = 0,
+            resident = false,
+            memory = false
+        )
         LOGGER:error("cannot load '%s': %s", path, reason)
 
         return nil, reason
@@ -1361,7 +1397,90 @@ function Audio.load(exclusive self: Audio, path: string, options: LoadOptions?):
         status = "ready",
         error = nil,
         duration = info.duration,
-        resident = info.resident
+        resident = info.resident,
+        memory = false
+    )
+    self.clipsById[id] = clip
+
+    return clip
+end
+
+--- Decodes a sound from the bytes of a whole encoded file and returns its
+--- cached clip.
+---
+--- The bytes are what the file would hold on disk, container and all, in any
+--- format `load` reads. A caller holding raw samples builds the container
+--- itself. The clip is always resident and keeps decoded samples rather than
+--- the bytes, which the caller may drop once this returns.
+---
+--- `name` is the clip's identity on the same terms as a path is for `load`,
+--- and shares its namespace: loading a name already loaded, from bytes or from
+--- a file, returns that clip without reading `bytes`, and a failure is cached
+--- the same way. A [`Sound`](tecs.audio.Sound) row and a snapshot carry the
+--- name, so a restored row starts once this mixer has loaded it again.
+---
+--- @param self the mixer that holds the clip
+--- @param name the non-empty identity, which is not a path and touches no file.
+---     Its extension, when it has one, may hint the format to the decoder,
+---     which reads the content either way.
+--- @param bytes the whole encoded file, which may contain zero bytes
+--- @param options the residency override, where only an unset or false
+---     `stream` is accepted
+--- @return the cached clip, or nil when the bytes could not be decoded
+--- @return the reason, when the first return is nil
+--- @raises string when the name is empty
+--- @raises string when `options.stream` is true
+function Audio.loadBytes(exclusive self: Audio, name: string, bytes: string, options: LoadOptions?): (Clip?, string?)
+    if name == "" then
+        error("tecs.audio.loadBytes: a clip name cannot be empty", 2)
+    end
+    if options ~= nil and options.stream == true then
+        error("tecs.audio.loadBytes: a clip from memory cannot stream, because there is no file to read from", 2)
+    end
+    local id = clipId(name)
+    local existing = self.clipsById[id]
+    if existing ~= nil then
+        if existing.status == "ready" then
+            return existing
+        end
+
+        return nil, existing.error or ("cannot decode " .. name)
+    end
+
+    local info: audiobackend.ClipInfo? = nil
+    local failure: string? = nil
+    local decode = self.backend.loadClipBytes
+    if decode == nil then
+        failure = "this audio backend cannot decode a clip from memory"
+    else
+        info, failure = decode(name, bytes, id)
+    end
+    if info == nil then
+        local reason = failure or ("cannot decode " .. name)
+        self.clipsById[
+            id
+        ] = new Clip(
+            path = name,
+            id = id,
+            status = "failed",
+            error = reason,
+            duration = 0,
+            resident = false,
+            memory = true
+        )
+        LOGGER:error("cannot decode '%s': %s", name, reason)
+
+        return nil, reason
+    end
+
+    local clip = new Clip(
+        path = name,
+        id = id,
+        status = "ready",
+        error = nil,
+        duration = info.duration,
+        resident = info.resident,
+        memory = true
     )
     self.clipsById[id] = clip
 
@@ -1405,7 +1524,9 @@ end
 --- A clip's index is its path's, so an edited file comes back under the index
 --- every [`Sound`](tecs.audio.Sound) row already carries and nothing in the
 --- world is touched. A streamed clip holds nothing to replace, so this reports
---- success and the next voice to start reads what is on disk now.
+--- success and the next voice to start reads what is on disk now. A clip
+--- `loadBytes` decoded has no file and kept no bytes, so this reports false
+--- for it and leaves it as it was.
 ---
 --- Blocking, like every other reload: it is a debug operation, and answering
 --- before the file has been read would report a success that had not happened.
@@ -1419,6 +1540,9 @@ function Audio.reload(exclusive self: Audio, path: string): (boolean, string?)
     local clip = id ~= nil and self.clipsById[id] or nil
     if clip == nil then
         return false, "nothing has loaded '" .. path .. "', so there is no clip to re-read"
+    end
+    if clip.memory then
+        return false, "'" .. path .. "' was decoded from bytes in memory, so there is no file to re-read"
     end
     if not clip.resident then
         return true
