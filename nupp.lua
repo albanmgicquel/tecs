@@ -234,6 +234,8 @@ return {
                     "tecs.internal.assetnative",
                     "tecs.assets",
                     "tecs.audio",
+                    "tecs.audio.synth",
+                    "tecs.internal.audiosynth",
                     "tecs.ecs",
                     "tecs.files",
                     "tecs.gfx",

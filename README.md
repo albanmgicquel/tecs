@@ -50,8 +50,9 @@ test suite reach the same world without starting a graphics stack.
 - Camera, layers with positioning modes, images, clips, sprite sheets with
   animation, and distance-field text.
 - Input across keyboard, pointer, gamepad and touch; audio playback, recording
-  and device enumeration; physics over Rapier; sequencing with tweening; asset
-  orchestration; file watching; and an MCP debug server.
+  and device enumeration; General MIDI from a SoundFont; physics over Rapier;
+  sequencing with tweening; asset orchestration; file watching; and an MCP
+  debug server.
 
 - [Tiled TMX maps and TSX tilesets](docs/tiled/index.md), animated tile and image
   layers, object factories, runtime tile edits and authored collision outlines.
@@ -487,6 +488,49 @@ The capture buffer is bounded rather than growing without limit as the SDL
 stream did. It holds one second by default, drops the oldest, and reports the
 loss through `Microphone.overruns`. An unbounded allocation driven by a
 realtime callback was not worth carrying across.
+
+## General MIDI is synthesized in-process
+
+`tecs.audio.synth` renders General MIDI from a SoundFont with `rustysynth`
+(MIT, pure Rust, no dependencies) as one voice of the mixer, rather than
+sending MIDI to whatever synthesizer the operating system offers. On a desktop
+the system synthesizer is software too: Apple's DLS synth on macOS, the
+Microsoft GS Wavetable synth on Windows, and on Linux nothing at all unless the
+player installed and started FluidSynth or TiMidity. Sending to it buys no
+quality and gives up three things a game needs. The music sounds the same on
+every machine, because the SoundFont ships with the game instead of being
+whatever bank the platform has. It goes through the mixer, so group gain, mute,
+pause and master gain apply to it like any other sound, and a system synth
+offers none of them. And it is deterministic: events carry a time on the
+synthesizer's own clock, the callback splits its render at those times, and the
+same schedule renders the same samples on every run, which a test can pin and
+a recording can reproduce. An external synth answers on its own clock and its
+own latency, and the mix of the two cannot be captured offline.
+
+Timing is exact to `rustysynth`'s internal block, which is where it applies
+MIDI and runs its envelopes. Tecs sets that block to eight frames, the smallest
+the library takes: every event lands on the first eight-frame boundary at or
+after its time, 0.17 milliseconds at worst at 48 kHz. Measured on FluidR3 GM
+with 48 notes held and the effects on, that costs 3.3 percent of one core
+against 1.9 at the library's default of 64 frames.
+
+Events cross to the output callback through a bounded single-producer,
+single-consumer ring, 4096 events, with as many again held in a preallocated
+schedule for events sent ahead of their time. The callback never waits and
+never allocates; a send that finds no room returns false and the event is
+dropped, because the alternatives are blocking the frame thread or growing a
+buffer the callback reads. A game streaming a song with a lookahead of a frame
+or two never comes near it.
+
+A hardware MIDI output is the extension this leaves room for and does not
+build. The seam is `tecs.platform.audiobackend.SynthPort`: `send` with a time,
+`notesOff`, `reset` and a clock. A second implementation over `midir`
+(CoreMIDI, WinMM, ALSA) would put a sender thread in Rust that holds the
+schedule and writes each message when its time comes, with `now` on the host's
+monotonic clock instead of rendered frames, chosen when the synth is made.
+Nothing above the port changes. It is deferred because nothing needs it yet,
+and what it costs is the determinism above: a hardware synth cannot be rendered
+offline.
 
 ## Device vocabularies follow the library that reports them
 

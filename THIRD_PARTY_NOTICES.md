@@ -81,6 +81,12 @@ Open Font License 1.1. The tests and retained UI example read it. Packages ship 
 `share/tecs/assets/fonts` with `JetBrainsMono-OFL.txt` and the versioned
 `JetBrainsMono-NOTICE.md`.
 
+## SoundFonts
+
+Tecs ships no SoundFont. `tecs.audio.synth` reads one a game supplies, and a
+General MIDI set is game content under its own licence, so a game that ships
+one ships that licence beside it. FluidR3 GM, for example, is MIT.
+
 ## Scope of the checks
 
 The generated inventory and source manifest make shipped dependency names,

@@ -48,7 +48,8 @@ export record Command
     --- `tecs.audio.clipId` assigned.
     clip: integer
 
-    --- Caller-writable. Carries the `LOOP`, `SPATIAL` and `STEREO` bits.
+    --- Caller-writable. Carries the `LOOP`, `SPATIAL`, `STEREO`, `STREAM` and
+    --- `SYNTH` bits.
     flags: integer
 
     --- Caller-writable. Sets linear amplitude for `PLAY`, `SET_GAIN` and
@@ -89,6 +90,37 @@ export record ClipInfo
     --- Read-only. Reports whether decoded samples stay in memory and are
     --- shared by every voice reading the clip.
     resident: boolean
+end
+
+--- Sends General MIDI to one synthesizer a backend renders as a voice.
+---
+--- Pushed rather than called back: each function queues or reads on the frame
+--- thread and returns, and the backend's audio thread takes the events from a
+--- bounded queue it never waits on. Every field is a plain function, so a test
+--- that wants to see what a game sent is a record of closures that logs.
+export record SynthPort
+    --- Read-only. Queues a short MIDI message for `at` seconds on this port's
+    --- clock, where zero or less means as soon as possible, and reports
+    --- whether the queue had room.
+    send: function(status: integer, data1: integer, data2: integer, at: number): boolean
+
+    --- Read-only. Queues a release of every note on `channel`, or on every
+    --- channel when `channel` is negative, cutting them without their release
+    --- when `immediate` is set. Reports whether the queue had room.
+    notesOff: function(channel: integer, immediate: boolean): boolean
+
+    --- Read-only. Queues a return to General MIDI defaults that discards every
+    --- event sent before it and not yet applied, and reports whether the queue
+    --- had room.
+    reset: function(): boolean
+
+    --- Read-only. Reports the port's clock in seconds: the frames the
+    --- synthesizer has rendered over the output rate. Zero until it renders.
+    now: function(): number
+
+    --- Read-only. Frees the port. Calling it twice is harmless, and nothing
+    --- sent afterwards reaches anything.
+    close: function(): nil
 end
 
 --- Selects residency for a load.
@@ -158,6 +190,23 @@ export record Backend
     --- Read-only. Reports the decoder names this build linked, in the
     --- backend's own order.
     decoders: function(): {string}
+
+    --- Read-only. Reads a SoundFont 2 file and returns the id `openSynth`
+    --- names it by, or nil and a reason. Omitted by a backend with no
+    --- synthesizer, which `tecs.audio.synth` answers with a SoundFont that
+    --- holds nothing.
+    loadSoundFont: (function(path: string): (integer?, string?))?
+
+    --- Read-only. Drops a SoundFont. Synthesizers already opened on it play on.
+    releaseSoundFont: (function(font: integer): nil)?
+
+    --- Read-only. Opens a synthesizer on a loaded SoundFont for the voice
+    --- `handle` names, which starts sounding when a `PLAY` carrying that
+    --- handle and the `SYNTH` flag is submitted. `polyphony` is the notes it
+    --- sounds at once and `effects` turns its reverb and chorus on. Returns
+    --- the port, or nil and a reason. Omitted by a backend with no
+    --- synthesizer, which `tecs.audio.synth` answers with `silentSynth`.
+    openSynth: (function(font: integer, handle: integer, polyphony: integer, effects: boolean): (SynthPort?, string?))?
 
     --- Read-only. Stops everything and closes the output. Calling it twice is
     --- harmless.
@@ -322,6 +371,10 @@ export const STEREO: integer = 4
 --- samples.
 export const STREAM: integer = 8
 
+--- Marks a `PLAY` whose input is the synthesizer `openSynth` opened for the
+--- command's handle, rather than a clip.
+export const SYNTH: integer = 16
+
 --- Creates one zeroed command, for a caller filling a reusable buffer.
 --- @return a command whose every field is at rest
 export function newCommand(): Command
@@ -379,6 +432,32 @@ export function silent(): Backend
         end,
         decoders = function(): {string}
             return {}
+        end,
+        close = function(): nil
+        end
+    )
+end
+
+--- Creates a synthesizer port that accepts everything and renders nothing.
+---
+--- What a synthesizer gets on a mixer with no output, and on a backend that
+--- has no synthesizer of its own. Every event is taken and dropped, and the
+--- clock stays at zero because no frame is ever rendered.
+---
+--- @return a port whose sends all succeed and whose clock reads zero
+export function silentSynth(): SynthPort
+    return new SynthPort(
+        send = function(_status: integer, _data1: integer, _data2: integer, _at: number): boolean
+            return true
+        end,
+        notesOff = function(_channel: integer, _immediate: boolean): boolean
+            return true
+        end,
+        reset = function(): boolean
+            return true
+        end,
+        now = function(): number
+            return 0
         end,
         close = function(): nil
         end
