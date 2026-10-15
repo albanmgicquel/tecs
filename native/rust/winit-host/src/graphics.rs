@@ -46,6 +46,7 @@ use crate::graph::{
     parse_graph, ClearMode, DepthMode, Graph, Input, TargetAllocator, TargetFormat, TargetStore,
     MAX_OUTPUTS,
 };
+use crate::pacing::{Acquire, Acquirer};
 use crate::packet::{
     parse_frame, Batch, RetainedScene, CAST_FANOUT, INSTANCE_STRIDE, LANE_BLEND, LANE_COUNT,
     LANE_OPAQUE, LIGHT_STRIDE, MAX_LIGHTS, SAMPLER_COUNT, SCENE_FLOATS,
@@ -478,7 +479,10 @@ pub struct Graphics {
     rendering_view: bool,
     asset_revision: u64,
     view_compositor: Option<views::Compositor>,
-    surface: Option<Surface<'static>>,
+    surface: Option<Arc<Surface<'static>>>,
+    /// Acquires the surface's drawables off the main thread, when the window's
+    /// frame loop asked for it. See `crate::pacing`.
+    acquirer: Option<Acquirer<SurfaceSource>>,
     offscreen: Option<wgpu::Texture>,
     capture_requested: bool,
     captured: Option<Result<Capture>>,
@@ -547,6 +551,16 @@ pub struct Graphics {
     failed: Arc<Mutex<Option<String>>>,
 }
 
+/// The window surface as the drawable source of an [`Acquirer`].
+struct SurfaceSource(Arc<Surface<'static>>);
+
+impl Acquire for SurfaceSource {
+    type Output = CurrentSurfaceTexture;
+    fn acquire(&self) -> CurrentSurfaceTexture {
+        self.0.get_current_texture()
+    }
+}
+
 fn benchmark_present_mode(supported: &[wgpu::PresentMode]) -> Result<wgpu::PresentMode> {
     [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox]
         .into_iter()
@@ -557,7 +571,15 @@ fn benchmark_present_mode(supported: &[wgpu::PresentMode]) -> Result<wgpu::Prese
 }
 
 impl Graphics {
-    pub fn new(window: Arc<Window>, display: OwnedDisplayHandle, benchmark: bool) -> Result<Self> {
+    /// Creates the renderer for a window. `threaded_acquire` acquires each
+    /// drawable on a worker thread (see `crate::pacing`), so that
+    /// [`Graphics::drawable_ready`] can answer without waiting for a vsync.
+    pub fn new(
+        window: Arc<Window>,
+        display: OwnedDisplayHandle,
+        benchmark: bool,
+        threaded_acquire: bool,
+    ) -> Result<Self> {
         let size = window.inner_size();
         let instance = Instance::new(InstanceDescriptor {
             display: Some(Box::new(display)),
@@ -615,7 +637,40 @@ impl Graphics {
             );
         }
         let pack = load_pack()?;
-        Self::assemble(Some(surface), device, queue, config, pack)
+        let surface = Arc::new(surface);
+        let mut graphics = Self::assemble(Some(Arc::clone(&surface)), device, queue, config, pack)?;
+        if threaded_acquire {
+            graphics.acquirer = Some(Acquirer::new(Arc::new(SurfaceSource(surface))));
+        }
+        Ok(graphics)
+    }
+
+    /// Reports whether the next frame can acquire its drawable without waiting.
+    /// Always true without a worker thread, and without a surface.
+    pub fn drawable_ready(&mut self) -> bool {
+        self.acquirer.as_mut().is_none_or(Acquirer::is_ready)
+    }
+
+    /// Reconfigures the surface, first dropping any drawable acquired for the
+    /// old configuration.
+    fn configure_surface(&mut self) {
+        if let Some(acquirer) = &mut self.acquirer {
+            acquirer.settle();
+        }
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
+    }
+
+    /// The next drawable: from the worker thread when there is one (waiting
+    /// for it only if the frame loop ran out of patience), else acquired here.
+    fn acquire_frame(&mut self) -> Option<CurrentSurfaceTexture> {
+        if let Some(acquirer) = &mut self.acquirer {
+            return acquirer.take();
+        }
+        self.surface
+            .as_ref()
+            .map(|surface| surface.get_current_texture())
     }
 
     /// Uses the production frame graph on a fixed GPU target without a desktop surface.
@@ -663,7 +718,7 @@ impl Graphics {
     /// Split out so a test can hand in a headless device and the same code
     /// answers.
     fn assemble(
-        surface: Option<Surface<'static>>,
+        surface: Option<Arc<Surface<'static>>>,
         device: Device,
         queue: Queue,
         config: SurfaceConfiguration,
@@ -943,6 +998,7 @@ impl Graphics {
             asset_revision: 0,
             view_compositor: None,
             surface,
+            acquirer: None,
             offscreen,
             capture_requested: false,
             captured: None,
@@ -1011,9 +1067,7 @@ impl Graphics {
         }
         self.config.width = width;
         self.config.height = height;
-        if let Some(surface) = &self.surface {
-            surface.configure(&self.device, &self.config);
-        }
+        self.configure_surface();
     }
 
     /// Makes one image resident, replacing whatever already lived under its id.
@@ -1951,8 +2005,8 @@ impl Graphics {
             let _ = self.image_bind_group(batch.image, batch.sampler);
         }
 
-        let (frame, reconfigure) = if let Some(surface) = &self.surface {
-            match surface.get_current_texture() {
+        let (frame, reconfigure) = if let Some(acquired) = self.acquire_frame() {
+            match acquired {
                 CurrentSurfaceTexture::Success(frame) => (Some(frame), false),
                 CurrentSurfaceTexture::Suboptimal(frame) => (Some(frame), true),
                 CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {
@@ -1968,9 +2022,7 @@ impl Graphics {
                     // here and drawn next frame, which is one dropped frame rather
                     // than a dead window. The queued writes are flushed as above.
                     self.queue.submit(std::iter::empty());
-                    if let Some(surface) = &self.surface {
-                        surface.configure(&self.device, &self.config);
-                    }
+                    self.configure_surface();
                     return Ok(false);
                 }
                 CurrentSurfaceTexture::Validation => {
@@ -2266,9 +2318,12 @@ impl Graphics {
             self.queue.present(frame);
         }
         if reconfigure {
-            if let Some(surface) = &self.surface {
-                surface.configure(&self.device, &self.config);
-            }
+            self.configure_surface();
+        }
+        // The worker starts on the next drawable now, while this thread goes
+        // back to the event loop.
+        if let Some(acquirer) = &mut self.acquirer {
+            acquirer.request();
         }
         Ok(true)
     }
