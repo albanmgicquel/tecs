@@ -21,6 +21,12 @@
 //! late, and where it lands depends only on its frame, which is what makes the
 //! output a deterministic function of the schedule.
 //!
+//! The ring, the schedule and the source are not particular to General MIDI.
+//! Anything that implements [`Target`] plays through them, and each target
+//! names its own grid: eight frames for `rustysynth`, and one for the OPL
+//! emulator in [`crate::fm`], whose register writes take effect on the very
+//! sample they are due at.
+//!
 //! ```no_run
 //! use tecsaudio::synth::{self, Settings};
 //!
@@ -112,8 +118,12 @@ impl Default for Settings {
 }
 
 /// What a synthesizer is driven through, so the scheduler can be tested
-/// without a SoundFont.
+/// without a SoundFont and can drive more than one kind of synthesizer.
 pub trait Target: Send {
+    /// The frames between the points events can be applied at, which is the
+    /// grid an event's frame is rounded up to.
+    const BLOCK_FRAMES: usize;
+
     /// Applies one event at the current block boundary.
     fn apply(&mut self, event: &Event);
 
@@ -127,6 +137,8 @@ pub struct GeneralMidi {
 }
 
 impl Target for GeneralMidi {
+    const BLOCK_FRAMES: usize = BLOCK_FRAMES;
+
     fn apply(&mut self, event: &Event) {
         match event.kind {
             KIND_MESSAGE => {
@@ -215,6 +227,33 @@ impl Producer {
             .store(tail.wrapping_add(1), Ordering::Release);
         true
     }
+
+    /// Appends `count` events, the one `event` makes for each index, or none
+    /// of them when the ring cannot hold them all.
+    ///
+    /// The tail moves once, after the last is written, so the consumer sees
+    /// either the whole batch or nothing of it.
+    fn push_all(&mut self, count: usize, mut event: impl FnMut(usize) -> Event) -> bool {
+        let tail = self.ring.tail.load(Ordering::Relaxed);
+        let head = self.ring.head.load(Ordering::Acquire);
+        let capacity = self.ring.slots.len();
+        if count > capacity - tail.wrapping_sub(head) {
+            return false;
+        }
+        for index in 0..count {
+            let slot = tail.wrapping_add(index) % capacity;
+            // SAFETY: every slot from `tail` for `count` lies outside
+            // `head..tail`, since the check above left room for all of them,
+            // so the consumer is not reading any of them.
+            unsafe {
+                (*self.ring.slots[slot].get()).write(event(index));
+            }
+        }
+        self.ring
+            .tail
+            .store(tail.wrapping_add(count), Ordering::Release);
+        true
+    }
 }
 
 /// The callback half of the ring.
@@ -267,12 +306,28 @@ impl Port {
         (seconds * self.sample_rate as f64).round() as u64
     }
 
-    fn push(&mut self, event: Event) -> bool {
+    /// Queues one event and reports whether the queue had room for it.
+    pub(crate) fn push(&mut self, event: Event) -> bool {
         if self.producer.push(event) {
             return true;
         }
         self.dropped += 1;
         false
+    }
+
+    /// Queues `count` events, the one `event` makes for each index, all or
+    /// none, and reports which. A refused batch counts as one drop.
+    pub(crate) fn push_all(&mut self, count: usize, event: impl FnMut(usize) -> Event) -> bool {
+        if self.producer.push_all(count, event) {
+            return true;
+        }
+        self.dropped += 1;
+        false
+    }
+
+    /// Reports the rate the clock counts frames at.
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Queues a short MIDI message for `at` seconds on the synthesizer clock,
@@ -302,6 +357,11 @@ impl Port {
 
     /// Queues a reset for the next block boundary. Every event sent before it
     /// and not yet applied is discarded when the callback reaches it.
+    ///
+    /// The scheduler also takes a reset with a frame, which is how
+    /// [`crate::fm::FmPort::reset`] schedules one: events sent before it and
+    /// due before its frame still apply, and those due at or after it are
+    /// discarded.
     pub fn reset(&mut self) -> bool {
         self.push(Event {
             frame: 0,
@@ -358,15 +418,18 @@ impl<T: Target> SynthSource<T> {
             let Some(mut event) = self.consumer.pop() else {
                 return;
             };
-            if event.kind == KIND_RESET {
-                // A reset undoes everything sent before it, including notes
-                // scheduled for later. Leaving those would play them over the
-                // silence the reset was sent to make.
-                self.schedule.clear();
-            }
             // A time already rendered becomes the next boundary, and sending
             // order is kept among events that land on the same one.
             event.frame = event.frame.max(self.frames);
+            if event.kind == KIND_RESET {
+                // A reset discards everything sent before it that is due at
+                // or after it, notes scheduled for later included: leaving
+                // those would play them over the silence the reset was sent
+                // to make. What is due before it still applies first, as it
+                // would have without the reset.
+                let at = event.frame;
+                self.schedule.retain(|queued| queued.frame < at);
+            }
             let at = self
                 .schedule
                 .partition_point(|queued| queued.frame <= event.frame);
@@ -396,11 +459,12 @@ impl<T: Target> Source for SynthSource<T> {
         self.sample_rate
     }
 
-    /// Renders up to the next internal block boundary.
+    /// Renders up to the next boundary of the target's grid.
     ///
     /// One block per call rather than as much as `out` holds, so a voice reads
     /// at most one block ahead of the output and an event sent now reaches the
-    /// next block rather than one a whole staging buffer later.
+    /// next block rather than one a whole staging buffer later. On a grid of
+    /// one frame that is a frame per call.
     fn read(&mut self, out: &mut [f32]) -> usize {
         let wanted = out.len() / 2;
         if wanted == 0 {
@@ -410,14 +474,14 @@ impl<T: Target> Source for SynthSource<T> {
         if self.phase == 0 {
             self.apply_due();
         }
-        let count = (BLOCK_FRAMES - self.phase).min(wanted);
+        let count = (T::BLOCK_FRAMES - self.phase).min(wanted);
         let (left, right) = (&mut self.left[..count], &mut self.right[..count]);
         self.target.render(left, right);
         for (index, (l, r)) in left.iter().zip(right.iter()).enumerate() {
             out[index * 2] = *l;
             out[index * 2 + 1] = *r;
         }
-        self.phase = (self.phase + count) % BLOCK_FRAMES;
+        self.phase = (self.phase + count) % T::BLOCK_FRAMES;
         self.frames += count as u64;
         self.shared.frames.store(self.frames, Ordering::Release);
         count
@@ -464,8 +528,8 @@ pub fn assemble<T: Target>(target: T, sample_rate: u32) -> (Port, SynthSource<T>
         frames: 0,
         phase: 0,
         sample_rate,
-        left: vec![0.0; BLOCK_FRAMES],
-        right: vec![0.0; BLOCK_FRAMES],
+        left: vec![0.0; T::BLOCK_FRAMES],
+        right: vec![0.0; T::BLOCK_FRAMES],
     };
     (port, source)
 }
@@ -529,6 +593,8 @@ mod tests {
     }
 
     impl Target for Recorder {
+        const BLOCK_FRAMES: usize = BLOCK_FRAMES;
+
         fn apply(&mut self, event: &Event) {
             self.applied
                 .lock()

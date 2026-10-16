@@ -3194,6 +3194,7 @@ dependencies = [
  "cpal",
  "rustysynth",
  "symphonia",
+ "ymfm-oxide",
 ]
 
 [[package]]
@@ -4360,6 +4361,11 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+
+[[package]]
+name = "ymfm-oxide"
+version = "0.1.0"
+source = "git+https://github.com/albanmgicquel/ymfm-oxide?rev=4cc9e106c7dbf28c848a9a463bf3ef74709a5ed0#4cc9e106c7dbf28c848a9a463bf3ef74709a5ed0"
 
 [[package]]
 name = "zerocopy"
