@@ -593,33 +593,66 @@ pub unsafe extern "C" fn tecs_audio_synth_close(synth: *mut Port) {
     }
 }
 
-/// Opens an emulated OPL2, or an OPL3 when `opl3` is nonzero, for the voice
+/// Opens the emulated FM chip `name` selects at `clock` hertz, for the voice
 /// `handle` names.
 ///
-/// The chip starts sounding when a `PLAY` carrying the same handle and the
-/// synth flag reaches `tecs_audio_submit`, as a General MIDI synthesizer does.
-/// Until then writes wait in its queue and its clock stands at zero.
+/// `name` is a part number in lower case, such as `ym2612`, or `opl2` and
+/// `opl3`. A clock of zero means the chip's own; any other is clamped to the
+/// range `fm::MIN_CLOCK` to `fm::MAX_CLOCK`. The chip starts sounding when a
+/// `PLAY` carrying the same handle and the synth flag reaches
+/// `tecs_audio_submit`, as a General MIDI synthesizer does. Until then writes
+/// wait in its queue and its clock stands at zero.
 ///
 /// # Safety
 ///
-/// The pointer must name a live device. The returned port is owned by the
-/// caller, outlives the device safely, and is freed by `tecs_audio_fm_close`.
+/// The pointer must name a live device and `name` a NUL-terminated string.
+/// The returned port is owned by the caller, outlives the device safely, and
+/// is freed by `tecs_audio_fm_close`.
 ///
 /// @return the port, or null with the reason left for `tecs_audio_last_error`
 #[no_mangle]
 pub unsafe extern "C" fn tecs_audio_fm_open(
     device: *mut Engine,
     handle: u32,
-    opl3: i32,
+    name: *const c_char,
+    clock: u32,
 ) -> *mut FmPort {
     let value = match unsafe { engine(device) } {
         None => return std::ptr::null_mut(),
         Some(value) => value,
     };
-    let kind = if opl3 != 0 { Kind::Opl3 } else { Kind::Opl2 };
-    match value.open_fm(handle, kind) {
+    if name.is_null() {
+        value.fail("an FM chip needs a name".to_string());
+        return std::ptr::null_mut();
+    }
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    let Some(kind) = Kind::from_name(&name) else {
+        value.fail(format!("tecsaudio emulates no FM chip named {name}"));
+        return std::ptr::null_mut();
+    };
+    let clock = if clock == 0 {
+        kind.default_clock()
+    } else {
+        clock
+    };
+    match value.open_fm(handle, kind, clock) {
         Err(_) => std::ptr::null_mut(),
         Ok(port) => Box::into_raw(Box::new(port)),
+    }
+}
+
+/// Reports the rate of a chip's clock, in frames a second.
+///
+/// # Safety
+///
+/// The pointer must name a live port, or be null.
+///
+/// @return the rate, and zero for a null port
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_fm_rate(fm: *mut FmPort) -> u32 {
+    match unsafe { fm_port(fm) } {
+        None => 0,
+        Some(port) => port.rate(),
     }
 }
 
@@ -665,7 +698,35 @@ pub unsafe extern "C" fn tecs_audio_fm_write(
     }
 }
 
-/// Queues `count` register writes for `at`, all or none.
+/// Queues one write of `data` to the port at `offset`, for `at` seconds on
+/// the chip clock.
+///
+/// # Safety
+///
+/// The pointer must name a live port.
+///
+/// @return nonzero when the queue took the write, and zero when it was full
+///     or the offset or data is out of the chip's range
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_fm_write_port(
+    fm: *mut FmPort,
+    offset: u32,
+    data: u32,
+    at: f64,
+) -> i32 {
+    match unsafe { fm_port(fm) } {
+        None => 0,
+        Some(port) => {
+            let (Ok(offset), Ok(data)) = (u16::try_from(offset), u8::try_from(data)) else {
+                return 0;
+            };
+            i32::from(port.write_port(offset, data, at))
+        }
+    }
+}
+
+/// Queues `count` writes for `at`, all or none: register writes, or port
+/// writes when `ports` is nonzero.
 ///
 /// # Safety
 ///
@@ -680,6 +741,7 @@ pub unsafe extern "C" fn tecs_audio_fm_writes(
     writes: *const RegisterWrite,
     count: u32,
     at: f64,
+    ports: i32,
 ) -> i32 {
     let Some(port) = (unsafe { fm_port(fm) }) else {
         return 0;
@@ -691,7 +753,7 @@ pub unsafe extern "C" fn tecs_audio_fm_writes(
         return 0;
     }
     let batch = unsafe { std::slice::from_raw_parts(writes, count as usize) };
-    i32::from(port.writes(batch, at))
+    i32::from(port.writes(batch, at, ports != 0))
 }
 
 /// Queues a return to the chip's power-on state for `at` seconds on the chip
@@ -708,6 +770,40 @@ pub unsafe extern "C" fn tecs_audio_fm_reset(fm: *mut FmPort, at: f64) -> i32 {
         None => 0,
         Some(port) => i32::from(port.reset(at)),
     }
+}
+
+/// Replaces one memory image of a chip, from its next frame, with a copy of
+/// the `length` bytes at `bytes`. `class` is 0 for ADPCM-A, 1 for ADPCM-B and
+/// 2 for PCM.
+///
+/// # Safety
+///
+/// The pointer must name a live port, and `bytes` must point at `length`
+/// readable bytes, or may be null when `length` is zero.
+///
+/// @return nonzero when the image was queued, and zero when the chip reads no
+///     memory of that class, the image is too large, or the queue is full
+#[no_mangle]
+pub unsafe extern "C" fn tecs_audio_fm_memory(
+    fm: *mut FmPort,
+    class: u32,
+    bytes: *const u8,
+    length: usize,
+) -> i32 {
+    let Some(port) = (unsafe { fm_port(fm) }) else {
+        return 0;
+    };
+    let Some(class) = fm::MemoryClass::from_index(class) else {
+        return 0;
+    };
+    let image: &[u8] = if length == 0 {
+        &[]
+    } else if bytes.is_null() {
+        return 0;
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, length) }
+    };
+    i32::from(port.set_memory(class, image))
 }
 
 /// Reports the chip clock: the samples it has rendered over its own rate.
@@ -1386,17 +1482,24 @@ mod tests {
         let null: *mut FmPort = std::ptr::null_mut();
         unsafe {
             assert_eq!(tecs_audio_fm_write(null, 0xb0, 0x20, 0.0), 0);
-            assert_eq!(tecs_audio_fm_writes(null, std::ptr::null(), 0, 0.0), 0);
+            assert_eq!(tecs_audio_fm_write_port(null, 0, 0x20, 0.0), 0);
+            assert_eq!(tecs_audio_fm_writes(null, std::ptr::null(), 0, 0.0, 0), 0);
+            assert_eq!(tecs_audio_fm_memory(null, 0, std::ptr::null(), 0), 0);
             assert_eq!(tecs_audio_fm_reset(null, 0.0), 0);
             assert_eq!(tecs_audio_fm_now(null), 0.0);
+            assert_eq!(tecs_audio_fm_rate(null), 0);
             tecs_audio_fm_close(null);
 
             let device = tecs_audio_open_offline(48_000, 2, 8);
-            let opl2 = tecs_audio_fm_open(device, 65_537, 0);
+            let name = |text: &str| CString::new(text).expect("a name");
+            let opl2 = tecs_audio_fm_open(device, 65_537, name("opl2").as_ptr(), 0);
             assert!(!opl2.is_null());
+            assert_eq!(tecs_audio_fm_rate(opl2), fm::RATE);
             assert_eq!(tecs_audio_fm_write(opl2, 0xb0, 0x20, 0.0), 1);
             assert_eq!(tecs_audio_fm_write(opl2, 0x100, 0x20, 0.0), 0);
             assert_eq!(tecs_audio_fm_write(opl2, 0xb0, 0x100, 0.0), 0);
+            assert_eq!(tecs_audio_fm_write_port(opl2, 1, 0x20, 0.0), 1);
+            assert_eq!(tecs_audio_fm_write_port(opl2, 2, 0x20, 0.0), 0);
             let batch = [
                 RegisterWrite {
                     register: 0xa0,
@@ -1407,18 +1510,30 @@ mod tests {
                     value: 0x32,
                 },
             ];
-            assert_eq!(tecs_audio_fm_writes(opl2, batch.as_ptr(), 2, 0.0), 1);
-            assert_eq!(tecs_audio_fm_writes(opl2, std::ptr::null(), 0, 0.0), 1);
-            assert_eq!(tecs_audio_fm_writes(opl2, std::ptr::null(), 2, 0.0), 0);
+            assert_eq!(tecs_audio_fm_writes(opl2, batch.as_ptr(), 2, 0.0, 0), 1);
+            assert_eq!(tecs_audio_fm_writes(opl2, batch.as_ptr(), 2, 0.0, 1), 0);
+            assert_eq!(tecs_audio_fm_writes(opl2, std::ptr::null(), 0, 0.0, 0), 1);
+            assert_eq!(tecs_audio_fm_writes(opl2, std::ptr::null(), 2, 0.0, 0), 0);
+            assert_eq!(tecs_audio_fm_memory(opl2, 0, [1u8].as_ptr(), 1), 0);
             assert_eq!(tecs_audio_fm_reset(opl2, 0.0), 1);
             assert_eq!(tecs_audio_fm_now(opl2), 0.0);
-            let opl3 = tecs_audio_fm_open(device, 65_538, 1);
+            let opl3 = tecs_audio_fm_open(device, 65_538, name("opl3").as_ptr(), 0);
             assert_eq!(tecs_audio_fm_write(opl3, 0x1b0, 0x20, 0.0), 1);
+            let ym2610 = tecs_audio_fm_open(device, 65_539, name("ym2610").as_ptr(), 8_000_000);
+            assert_eq!(tecs_audio_fm_rate(ym2610), 55_555);
+            assert_eq!(tecs_audio_fm_memory(ym2610, 1, [1u8, 2].as_ptr(), 2), 1);
+            assert_eq!(tecs_audio_fm_memory(ym2610, 2, [1u8, 2].as_ptr(), 2), 0);
+            assert_eq!(tecs_audio_fm_memory(ym2610, 3, [1u8, 2].as_ptr(), 2), 0);
+            assert!(tecs_audio_fm_open(device, 65_540, name("sn76489").as_ptr(), 0).is_null());
+            let reason = CStr::from_ptr(tecs_audio_last_error(device)).to_string_lossy();
+            assert!(reason.contains("sn76489"), "{reason}");
+            assert!(tecs_audio_fm_open(device, 65_540, std::ptr::null(), 0).is_null());
             tecs_audio_close(device);
             // A port outlives its device.
             assert_eq!(tecs_audio_fm_write(opl2, 0xb0, 0x00, 0.0), 1);
             tecs_audio_fm_close(opl2);
             tecs_audio_fm_close(opl3);
+            tecs_audio_fm_close(ym2610);
         }
     }
 

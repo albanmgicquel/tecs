@@ -19,6 +19,8 @@ local record Harness
     sent: {Sent}
     opened: {integer}
     chips: {string}
+    clocks: {integer}
+    images: {string}
     closed: {integer}
     full: {boolean}
 end
@@ -28,6 +30,8 @@ local function newHarness(available: boolean, withFm: boolean): Harness
     local sent: {Sent} = {}
     local opened: {integer} = {}
     local chips: {string} = {}
+    local clocks: {integer} = {}
+    local images: {string} = {}
     local closed: {integer} = {0}
     local full = {false}
 
@@ -54,22 +58,43 @@ local function newHarness(available: boolean, withFm: boolean): Harness
         end
     end
     if withFm then
-        backend.openFm = function(handle: integer, chip: audiobackend.FmChip): (audiobackend.FmPort?, string?)
+        backend.openFm = function(
+            handle: integer,
+            chip: audiobackend.FmChip,
+            clock: integer
+        ): (audiobackend.FmPort?, string?)
             opened[#opened + 1] = handle
             chips[#chips + 1] = chip
+            clocks[#clocks + 1] = clock
+
+            --- The list is the caller's, so the log keeps a copy.
+            local function copied(pairs: {integer}, count: integer): {integer}
+                local copy: {integer} = {}
+                for index = 1, 2 * count do
+                    copy[index] = pairs[index]
+                end
+
+                return copy
+            end
 
             return new audiobackend.FmPort(
+                rate = 12345,
                 write = function(register: integer, value: integer, at: number): boolean
                     return record("write", {register, value}, at)
                 end,
                 writes = function(pairs: {integer}, count: integer, at: number): boolean
-                    -- The list is the caller's, so the log keeps a copy.
-                    local copy: {integer} = {}
-                    for index = 1, 2 * count do
-                        copy[index] = pairs[index]
-                    end
+                    return record("writes", copied(pairs, count), at)
+                end,
+                writePort = function(offset: integer, data: integer, at: number): boolean
+                    return record("writePort", {offset, data}, at)
+                end,
+                writePorts = function(pairs: {integer}, count: integer, at: number): boolean
+                    return record("writePorts", copied(pairs, count), at)
+                end,
+                setMemory = function(class: audiobackend.FmMemory, image: string): boolean
+                    images[#images + 1] = class .. ":" .. image
 
-                    return record("writes", copy, at)
+                    return record("setMemory", {#image}, 0)
                 end,
                 reset = function(at: number): boolean
                     return record("reset", {}, at)
@@ -90,6 +115,8 @@ local function newHarness(available: boolean, withFm: boolean): Harness
         sent = sent,
         opened = opened,
         chips = chips,
+        clocks = clocks,
+        images = images,
         closed = closed,
         full = full
     )
@@ -114,9 +141,13 @@ end
 function suite.startsTheChipAsOneVoiceOfTheMixer(): nil
     local harness = newHarness(true, true)
     local mixer, chip = made(harness, {chip = "opl3", group = "music", gain = 0.5})
-    test.equal(chip.rate, 49715)
+    test.equal(chip.rate, 12345, "the rate is the port's")
     test.equal(chip.chip, "opl3")
+    test.equal(chip.clock, 14318180)
+    test.equal(chip.lastRegister, 0x1FF)
+    test.equal(chip.lastPort, 3)
     test.equal(harness.chips[1], "opl3")
+    test.equal(harness.clocks[1], 14318180)
     test.equal(mixer:sounding(), 1)
     mixer:update()
     local play = assert(lastCommand(harness, audiobackend.PLAY))
@@ -293,6 +324,119 @@ function suite.takesAVoiceButRendersNothingOnABackendWithNoFm(): nil
     test.equal(chip:now(), 0)
 end
 
+function suite.makesAnyChipByNameOnItsOwnClockOrAGivenOne(): nil
+    local harness = newHarness(true, true)
+    local mixer = audio.newAudio({backend = harness.backend, maxVoices = 4})
+    local genesis = assert(fm.new(mixer, {chip = "ym2612"}))
+    test.equal(genesis.clock, 7670453)
+    test.equal(genesis.lastRegister, 0x1FF)
+    test.equal(harness.chips[1], "ym2612")
+    test.equal(harness.clocks[1], 7670453)
+    local opl4 = assert(fm.new(mixer, {chip = "ymf278b", clock = 33868800}))
+    test.equal(opl4.lastRegister, 0x2FF)
+    test.equal(opl4.lastPort, 5)
+    local opq = assert(fm.new(mixer, {chip = "ym3806"}))
+    test.equal(opq.lastRegister, 0x11F)
+    test.assert(opq:write(0x11F, 1))
+    local ssg = assert(fm.new(mixer, {chip = "ym2149", clock = 2000000}))
+    test.equal(ssg.lastPort, 3)
+    test.equal(harness.clocks[4], 2000000)
+    test.raises(
+        function(): nil
+            fm.new(mixer, {chip = "ym2151", clock = 99999})
+        end,
+        "clock must be a whole number of hertz"
+    )
+    test.raises(
+        function(): nil
+            fm.new(mixer, {chip = "sn76489" as fm.Chip})
+        end,
+        "fm.chips"
+    )
+end
+
+function suite.namesEveryChipWithItsClockRateAndMemory(): nil
+    local names = fm.chips()
+    test.equal(#names, 26)
+    test.equal(names[1], "ym3526")
+    test.equal(names[26], "opl3")
+    test.equal(fm.rate("opl2"), 49715)
+    test.equal(fm.rate("opl3"), 49715)
+    test.equal(fm.rate("ym2612"), 53267)
+    -- Rendered at three times its FM rate, then averaged three to a frame.
+    test.equal(fm.rate("ym2203"), 55466)
+    test.equal(fm.rate("ymf288"), 55466)
+    test.equal(fm.rate("ym2151", 4000000), 62500)
+    test.equal(fm.defaultClock("ym2149"), 1789772)
+    test.equal(#fm.memoryClasses("ym2612"), 0)
+    test.equal(fm.memoryClasses("ym2610")[1], "adpcmA")
+    test.equal(fm.memoryClasses("ym2610")[2], "adpcmB")
+    test.equal(fm.memoryClasses("y8950")[1], "adpcmB")
+    test.equal(fm.memoryClasses("ymf278b")[1], "pcm")
+end
+
+function suite.writesPortsAndChecksTheirRange(): nil
+    local harness = newHarness(true, true)
+    local _mixer, chip = made(harness, {chip = "ym2612"})
+    test.assert(chip:writePort(2, 0x2A, 0.5))
+    test.assert(chip:writePorts({0, 0x28, 1, 0xF0}, 1))
+    test.assert(chip:writePorts({}))
+    test.equal(#harness.sent, 2)
+    test.equal(harness.sent[1].kind, "writePort")
+    test.equal(harness.sent[1].pairs[1], 2)
+    test.equal(harness.sent[1].at, 0.5)
+    test.equal(harness.sent[2].kind, "writePorts")
+    test.equal(harness.sent[2].pairs[4], 0xF0)
+    test.raises(
+        function(): nil
+            chip:writePort(4, 0)
+        end,
+        "ym2612 port must be from 0x00 to 0x3, got 0x4"
+    )
+    test.raises(
+        function(): nil
+            chip:writePorts({0, 1, 2})
+        end,
+        "alternate port and value"
+    )
+end
+
+function suite.loadsMemoryOnlyOfAClassTheChipReads(): nil
+    local harness = newHarness(true, true)
+    local _mixer, chip = made(harness, {chip = "ym2610"})
+    test.assert(chip:setMemory("adpcmA", "\1\2\3"))
+    test.equal(harness.images[1], "adpcmA:\1\2\3")
+    test.raises(
+        function(): nil
+            chip:setMemory("pcm", "x")
+        end,
+        "the ym2610 reads no pcm memory"
+    )
+    chip:destroy()
+    test.assert(not chip:setMemory("adpcmB", "x"), "a destroyed chip loads nothing")
+end
+
+function suite.pausesPlacesAndFadesTheVoice(): nil
+    local harness = newHarness(true, true)
+    local mixer, chip = made(harness)
+    mixer:update()
+    local handle = assert(lastCommand(harness, audiobackend.PLAY)).handle
+    chip:pause()
+    test.assert(chip:paused())
+    mixer:update()
+    test.equal(assert(lastCommand(harness, audiobackend.PAUSE)).handle, handle)
+    chip:resume()
+    test.assert(not chip:paused())
+    chip:setStereo(1, 0)
+    mixer:update()
+    test.assert(lastCommand(harness, audiobackend.RESUME) ~= nil)
+    chip:destroy(0.25)
+    mixer:update()
+    local stop = assert(lastCommand(harness, audiobackend.STOP))
+    test.equal(stop.handle, handle)
+    test.equal(harness.closed[1], 1)
+end
+
 --- Returns the native binding, or skips when `libtecsaudio` is not staged.
 local function binding(): {[string]: any}
     local ok, loaded = pcall(require, "tecs.platform.audionative")
@@ -311,16 +455,38 @@ function suite.crossesIntoTheNativeChipThroughTheBackend(): nil
     -- The offline backend reports no output, so a mixer would give the chip
     -- no voice; the port is opened directly to reach the library.
     local openFm = assert(assert(backend).openFm)
+    for _, chip in ipairs(fm.chips()) do
+        local clock = fm.defaultClock(chip)
+        local port = assert(openFm(1, chip, clock))
+        -- The rate this module works out without the library is the one the
+        -- library reports, for every chip, at its own clock and at another.
+        test.equal(port.rate, fm.rate(chip), chip)
+        port.close()
+        local other = assert(openFm(1, chip, 4000000))
+        test.equal(other.rate, fm.rate(chip, 4000000), chip)
+        other.close()
+    end
     for _, chip in ipairs({"opl2", "opl3"} as {audiobackend.FmChip}) do
-        local port = assert(openFm(1, chip))
+        local port = assert(openFm(1, chip, fm.defaultClock(chip)))
+        test.equal(port.rate, 49715)
         test.assert(port.write(0xB0, 0x32, 0))
         test.assert(port.writes({0xA0, 0x41, 0xB0, 0x32}, 2, 0.1))
+        test.assert(port.writePort(0, 0x20, 0))
+        test.assert(port.writePorts({0, 0x20, 1, 0x01}, 2, 0.1))
+        test.assert(not port.setMemory("pcm", "x"), "an OPL reads no memory")
         test.assert(port.reset(0.2))
         test.equal(port.now(), 0)
         port.close()
         port.close()
         test.assert(not port.write(0xB0, 0x32, 0), "a closed port queues nothing")
     end
+    local ym2610 = assert(openFm(1, "ym2610", 8000000))
+    test.assert(ym2610.setMemory("adpcmA", string.rep("\x12", 512)))
+    test.assert(ym2610.setMemory("adpcmB", ""))
+    ym2610.close()
+    local refused, reason = openFm(1, "sn76489" as audiobackend.FmChip, 4000000)
+    test.equal(refused, nil)
+    test.matches(assert(reason), "sn76489")
     assert(backend).close()
 end
 

@@ -80,6 +80,15 @@ pub const KIND_NOTES_OFF: u8 = 1;
 /// Returns every channel to its General MIDI defaults and silences every note.
 pub const KIND_RESET: u8 = 2;
 
+/// Replaces one memory image of an FM chip with the next one on its memory
+/// channel: [`crate::fm`] only. Unlike every other event, a reset does not
+/// discard it.
+pub const KIND_MEMORY: u8 = 3;
+
+/// Writes `data2` to the port whose offset is `status` and `data1`, low byte
+/// first: [`crate::fm`] only.
+pub const KIND_PORT: u8 = 4;
+
 /// Names every channel in a `KIND_NOTES_OFF` event.
 pub const ALL_CHANNELS: u8 = 0xFF;
 
@@ -325,6 +334,21 @@ impl Port {
         false
     }
 
+    /// Reports whether the ring has room for one more event.
+    ///
+    /// The answer holds until this port pushes, since the callback only ever
+    /// takes events out.
+    pub(crate) fn has_room(&self) -> bool {
+        let tail = self.producer.ring.tail.load(Ordering::Relaxed);
+        let head = self.producer.ring.head.load(Ordering::Acquire);
+        tail.wrapping_sub(head) < self.producer.ring.slots.len()
+    }
+
+    /// Counts a send refused before it reached the ring.
+    pub(crate) fn refuse(&mut self) {
+        self.dropped += 1;
+    }
+
     /// Reports the rate the clock counts frames at.
     pub(crate) fn sample_rate(&self) -> u32 {
         self.sample_rate
@@ -427,8 +451,12 @@ impl<T: Target> SynthSource<T> {
                 // those would play them over the silence the reset was sent
                 // to make. What is due before it still applies first, as it
                 // would have without the reset.
+                // A memory load is kept whatever its time: its image is
+                // already on its way, and dropping the event would leave the
+                // image for the next load to take.
                 let at = event.frame;
-                self.schedule.retain(|queued| queued.frame < at);
+                self.schedule
+                    .retain(|queued| queued.frame < at || queued.kind == KIND_MEMORY);
             }
             let at = self
                 .schedule

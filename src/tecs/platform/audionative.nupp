@@ -193,16 +193,28 @@ cdef function tecs_audio_synth_close(borrows synth: voidptr?)
 -- The FM chip. A port is a handle of its own, as a synthesizer's is, and the
 -- batch of writes crosses as a `carray` of `tecsAudioFmWrite`.
 
-cdef function tecs_audio_fm_open(borrows device: voidptr?, handle: uint32, opl3: int32): voidptr?
+cdef function tecs_audio_fm_open(
+    borrows device: voidptr?,
+    handle: uint32,
+    borrows name: cstring,
+    clock: uint32
+): voidptr?
+
+cdef function tecs_audio_fm_rate(borrows fm: voidptr?): uint32
 
 cdef function tecs_audio_fm_write(borrows fm: voidptr?, register: uint32, value: uint32, at: number): int32
+
+cdef function tecs_audio_fm_write_port(borrows fm: voidptr?, offset: uint32, data: uint32, at: number): int32
 
 cdef function tecs_audio_fm_writes(
     borrows fm: voidptr?,
     borrows writes: tecsAudioFmWrite*,
     count: uint32,
-    at: number
+    at: number,
+    ports: int32
 ): int32
+
+cdef function tecs_audio_fm_memory(borrows fm: voidptr?, class: uint32, borrows bytes: cstring, length: uint64): int32
 
 cdef function tecs_audio_fm_reset(borrows fm: voidptr?, at: number): int32
 
@@ -561,17 +573,36 @@ local function wrap(openDevice: function(): voidptr?, absent: string): (audiobac
     --- crosses before the next is filled.
     local batch = carray(tecsAudioFmWrite, FM_BATCH)
 
-    local function openFm(handle: integer, chip: audiobackend.FmChip): (audiobackend.FmPort?, string?)
+    --- Fills the shared batch with the first `count` pairs of `pairs`, a
+    --- count every caller has already held to `FM_BATCH`.
+    local function fill(pairs: {integer}, count: integer): nil
+        for index = 0, count - 1 do
+            -- The index stays below `FM_BATCH` because every caller checks
+            -- `count` first, which the checker cannot read off a `carray`.
+            @unsafe do
+                local target = batch[index]
+                target.address = pairs[2 * index + 1] as uint32
+                target.value = pairs[2 * index + 2] as uint32
+            end
+        end
+    end
+
+    --- The wire number of each memory class, as `tecs_audio_fm_memory`
+    --- takes it.
+    local MEMORY_CLASSES: {[string]: integer} = {adpcmA = 0, adpcmB = 1, pcm = 2}
+
+    local function openFm(handle: integer, chip: audiobackend.FmChip, clock: integer): (audiobackend.FmPort?, string?)
         if closed[1] then
             return nil, "the audio output is closed"
         end
-        local fm = tecs_audio_fm_open(device, handle as uint32, (chip == "opl3" and 1 or 0) as int32)
+        local fm = tecs_audio_fm_open(device, handle as uint32, chip, clock as uint32)
         if fm == nil then
             return nil, reason("tecsaudio opened no FM chip")
         end
         local released = {false}
 
         return new audiobackend.FmPort(
+            rate = tecs_audio_fm_rate(fm) as integer,
             write = function(register: integer, value: integer, at: number): boolean
                 if released[1] then
                     return false
@@ -583,17 +614,31 @@ local function wrap(openDevice: function(): voidptr?, absent: string): (audiobac
                 if released[1] or count > FM_BATCH then
                     return false
                 end
-                for index = 0, count - 1 do
-                    -- The index stays below `FM_BATCH` because of the check
-                    -- above, which the checker cannot read off a `carray`.
-                    @unsafe do
-                        local target = batch[index]
-                        target.address = pairs[2 * index + 1] as uint32
-                        target.value = pairs[2 * index + 2] as uint32
-                    end
+                fill(pairs, count)
+
+                return tecs_audio_fm_writes(fm, batch, count as uint32, at, 0) ~= 0
+            end,
+            writePort = function(offset: integer, data: integer, at: number): boolean
+                if released[1] then
+                    return false
                 end
 
-                return tecs_audio_fm_writes(fm, batch, count as uint32, at) ~= 0
+                return tecs_audio_fm_write_port(fm, offset as uint32, data as uint32, at) ~= 0
+            end,
+            writePorts = function(pairs: {integer}, count: integer, at: number): boolean
+                if released[1] or count > FM_BATCH then
+                    return false
+                end
+                fill(pairs, count)
+
+                return tecs_audio_fm_writes(fm, batch, count as uint32, at, 1) ~= 0
+            end,
+            setMemory = function(class: audiobackend.FmMemory, image: string): boolean
+                if released[1] then
+                    return false
+                end
+
+                return tecs_audio_fm_memory(fm, MEMORY_CLASSES[class] as uint32, image, #image as uint64) ~= 0
             end,
             reset = function(at: number): boolean
                 if released[1] then

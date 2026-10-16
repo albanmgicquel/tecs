@@ -91,14 +91,16 @@ one ships that licence beside it. FluidR3 GM, for example, is MIT.
 
 ### ymfm-oxide
 
-`tecs.audio.fm` emulates its OPL2 and OPL3 with ymfm-oxide
+`tecs.audio.fm` emulates every chip it offers with ymfm-oxide
 (<https://github.com/albanmgicquel/ymfm-oxide>), a pure-Rust port by Alban
 Gicquel of ymfm, Aaron Giles's emulator of the Yamaha FM chips
 (<https://github.com/aaronsgiles/ymfm>). It is a Cargo dependency pinned to one
 commit, compiled into `tecsaudio`, so every package carries it and
 `cargo-licenses.txt` records it as BSD-3-Clause. The licence asks for its
 notice to travel with a binary, which is this one; Tecs keeps none of its
-source.
+source. The OPLL family plays ymfm's own copyright-free stand-ins for the
+instrument ROMs, made by David Viens and Hubert Lamontagne and carried in the
+crate; no Yamaha ROM ships with Tecs.
 
 ```text
 BSD 3-Clause License

@@ -50,9 +50,10 @@ test suite reach the same world without starting a graphics stack.
 - Camera, layers with positioning modes, images, clips, sprite sheets with
   animation, and distance-field text.
 - Input across keyboard, pointer, gamepad and touch; audio playback, recording
-  and device enumeration; General MIDI from a SoundFont; an emulated OPL2 and
-  OPL3 FM chip; physics over Rapier; sequencing with tweening; asset
-  orchestration; file watching; and an MCP debug server.
+  and device enumeration; General MIDI from a SoundFont; emulated Yamaha FM
+  chips, from the OPL2 and OPL3 to the YM2612 and the OPL4; physics over
+  Rapier; sequencing with tweening; asset orchestration; file watching; and an
+  MCP debug server.
 
 - [Tiled TMX maps and TSX tilesets](docs/tiled/index.md), animated tile and image
   layers, object factories, runtime tile edits and authored collision outlines.
@@ -612,6 +613,64 @@ second-bank address port at 2 and the data port at 3, which is how the chip
 itself folds a second-bank write back to the first until the NEW bit is set.
 The OPL3's left and right are its outputs A and B; the OPL2 is mono and plays
 its one output on both sides.
+
+## Every chip the emulator models is one voice, named by its part number
+
+`tecs.audio.fm` began as the OPL2 and OPL3 and now makes any of the 24 chips
+ymfm-oxide models, because the register logs a game ships or a player loads
+are not all DOS ones: a Mega Drive log is a YM2612, an arcade one a YM2151 or
+a YM2610, an MSX one a YM2413 beside a Y8950. The alternative was a module per
+family, and it lost because the families differ only in data a table holds:
+where the registers sit among the ports, what the input clock usually was, how
+the outputs reach two speakers and what memory the chip reads. The contract a
+game writes against, registers, a clock and `at`, is the same for all of them,
+so the chip is a name and a clock and nothing else changes. Names are Yamaha
+part numbers in lower case rather than family names, because a family name
+does not say which chip: an OPN is any of eight. `"opl2"` and `"opl3"` stay as
+aliases, so the first callers never notice.
+
+The register convenience stays the primary interface, since every log and every
+driver's source names registers, and it maps a register's high byte to the
+bank's address and data ports: one bank at offsets 0 and 1, the second at 2 and
+3, the OPL4's PCM registers as a third at 4 and 5, and the YM2149's data port
+at 2. The OPQ has no address port and is written by register. Port writes are
+offered beside it for the driver that wrote the bus itself, and a test holds the
+two to the same render.
+
+The chip renders at the emulator's own rate for its clock, which the voice
+resamples. Two consequences needed decisions. The OPN chips with an SSG default
+in ymfm to their highest fidelity, a megahertz for the YM2203, and run here at
+their lowest, which keeps every FM sample and averages the SSG's; and where the
+emulator still renders faster than 64 kHz, as the YM2203, the YM2608 and the
+YMF288 do, consecutive samples are averaged into one frame of the chip's clock.
+That keeps the mixer's linear resampler away from ratios where it aliases, and
+it puts a ceiling on `rate`, the unit of `at`. Outputs fold to stereo by a
+fixed table: a mono chip on both sides, the OPL3's A and B, the OPL4's mixed
+pair, the SSG at two thirds of its channels' sum, which is ymfm's own mix.
+The SSG's square waves swing between zero and a positive level, which a real
+board's output capacitor took out, so a chip with one has a 5 Hz high-pass
+filter on its output; without it a song would start and end with a click and
+carry an offset into the mix.
+
+External memory is images a game hands over, whole: `setMemory` replaces the
+ADPCM-A, ADPCM-B or PCM image from the next frame, and a reset keeps it. The
+images belong to the audio thread's half of the chip. ymfm reaches memory
+through the chip's interface, which the chip owns and not every chip lends
+back, so the interface holds a pointer to images the target owns, read and
+swapped only between samples on the one thread that renders; a lock around
+them was the alternative and lost, being a lock on the audio thread taken on
+every ADPCM fetch to protect nothing a second thread touches. An image crosses
+on a bounded channel of its own, paired with an event in the write queue that
+says when to take it, and the image it displaces goes back to the game thread
+to be freed there. Timers, busy time and the IRQ line are not offered: a log is
+already timed and a driver paces on `now`, and an answer from the emulator
+inside a call would need the audio thread to reply. What that leaves out is
+the OPN's CSM key-on and the ADPCM end-of-sample flags, which only a timer or a
+status read can drive.
+
+An idle chip at its usual clock costs between a fifth of a percent and one
+percent of a core in a release build, measured over a second of rendering; the
+YMF288 is the dearest and the YM2149 the cheapest.
 
 ## Device vocabularies follow the library that reports them
 

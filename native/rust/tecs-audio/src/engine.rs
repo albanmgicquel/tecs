@@ -181,7 +181,7 @@ impl Engine {
     }
 
     /// Records the reason a call is about to report.
-    fn fail(&self, reason: String) -> String {
+    pub(crate) fn fail(&self, reason: String) -> String {
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = reason.clone();
         }
@@ -359,16 +359,16 @@ impl Engine {
         }
     }
 
-    /// Creates an emulated OPL2 or OPL3 and parks its source for the `PLAY`
-    /// carrying `handle` and `FLAG_SYNTH`, as `open_synth` does.
+    /// Creates an emulated FM chip at `clock` hertz and parks its source for
+    /// the `PLAY` carrying `handle` and `FLAG_SYNTH`, as `open_synth` does.
     ///
-    /// The chip renders at its own rate, `fm::RATE`, and the voice resamples
-    /// it to the output.
+    /// The chip renders at its own rate, `kind.rate(clock)`, and the voice
+    /// resamples it to the output.
     ///
     /// @return the port register writes are sent through, or the reason
     ///     nothing opened
-    pub fn open_fm(&self, handle: u32, kind: Kind) -> Result<FmPort, String> {
-        let (port, source) = fm::open(kind);
+    pub fn open_fm(&self, handle: u32, kind: Kind, clock: u32) -> Result<FmPort, String> {
+        let (port, source) = fm::open(kind, clock);
         match self.synths.lock() {
             Err(_) => Err(self.fail("the synthesizer table is poisoned".to_string())),
             Ok(mut synths) => {
@@ -684,7 +684,9 @@ mod tests {
     #[test]
     fn an_fm_chip_started_by_its_play_renders_and_keeps_its_clock() {
         let engine = Engine::open_offline(48_000, 2, 8);
-        let mut port = engine.open_fm(257, Kind::Opl3).expect("an OPL3 opens");
+        let mut port = engine
+            .open_fm(257, Kind::Ymf262, fm::OPL3_CLOCK)
+            .expect("an OPL3 opens");
         assert!(port.reset(0.0));
         // A held note on channel 0, OPL3 mode and both outputs on.
         for (register, value) in [
