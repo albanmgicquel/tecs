@@ -167,7 +167,10 @@ export record Synth
     reset: function(exclusive self: Synth): boolean
     now: function(borrows self: Synth): number
     setGain: function(exclusive self: Synth, gain: number): nil
-    destroy: function(exclusive self: Synth): nil
+    pause: function(exclusive self: Synth): nil
+    resume: function(exclusive self: Synth): nil
+    paused: function(borrows self: Synth): boolean
+    destroy: function(exclusive self: Synth, fadeOut: number?): nil
 end
 
 --- The SoundFonts each mixer has loaded, by path, keyed weakly so a mixer that
@@ -467,17 +470,46 @@ function Synth.setGain(exclusive self: Synth, gain: number): nil
     self.mixer:setGain(self.voice, gain)
 end
 
+--- Pauses the synth's voice, which stops its clock with it.
+---
+--- Nothing is lost: every note holds where it stood, events already scheduled
+--- wait on the stopped clock, and `resume` carries on exactly where it left
+--- off.
+---
+--- @param self the synth to pause
+function Synth.pause(exclusive self: Synth): nil
+    self.mixer:pause(self.voice)
+end
+
+--- Resumes a paused synth.
+---
+--- @param self the synth to resume
+function Synth.resume(exclusive self: Synth): nil
+    self.mixer:resume(self.voice)
+end
+
+--- Reports whether the synth's own voice is paused, leaving its group aside.
+---
+--- @param self the synth to inspect
+--- @return true between `pause` and `resume`
+function Synth.paused(borrows self: Synth): boolean
+    return self.mixer:paused(self.voice)
+end
+
 --- Stops the synth's voice and frees its synthesizer. Safe more than once.
 ---
---- The voice stops without a fade, so a note still sounding is cut. Send
---- `allNotesOff` a little before this for a softer ending.
+--- Without a fade the voice stops at once, so a note still sounding is cut;
+--- send `allNotesOff` a little before for a softer ending. With one it fades
+--- over `fadeOut` seconds, the synthesizer rendering on and taking no more
+--- events, and goes when the fade ends.
 ---
 --- @param self the synth to destroy
-function Synth.destroy(exclusive self: Synth): nil
+--- @param fadeOut seconds to fade over, or nil to stop at once
+function Synth.destroy(exclusive self: Synth, fadeOut: number?): nil
     if self.destroyed then
         return
     end
     self.destroyed = true
-    self.mixer:stop(self.voice)
+    self.mixer:stop(self.voice, fadeOut)
     self.port.close()
 end

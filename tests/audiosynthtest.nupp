@@ -53,6 +53,7 @@ local function newHarness(available: boolean, withSynth: boolean): Harness
             copy.clip = source.clip
             copy.flags = source.flags
             copy.gain = source.gain
+            copy.fade = source.fade
             commands[#commands + 1] = copy
         end
     end
@@ -172,6 +173,27 @@ function suite.startsTheSynthAsOneVoiceOfTheMixer(): nil
     test.equal(assert(lastCommand(harness, audiobackend.STOP)).handle, play.handle)
     test.equal(harness.closed[1], 1)
     test.equal(mixer:sounding(), 0)
+end
+
+function suite.pausesTheVoiceAndFadesItOut(): nil
+    local harness = newHarness(true, true)
+    local mixer, music = made(harness)
+    mixer:update()
+    local handle = assert(lastCommand(harness, audiobackend.PLAY)).handle
+    music:pause()
+    test.assert(music:paused())
+    mixer:update()
+    test.equal(assert(lastCommand(harness, audiobackend.PAUSE)).handle, handle)
+    music:resume()
+    test.assert(not music:paused())
+    mixer:update()
+    test.equal(assert(lastCommand(harness, audiobackend.RESUME)).handle, handle)
+    music:destroy(0.75)
+    mixer:update()
+    local stop = assert(lastCommand(harness, audiobackend.STOP))
+    test.equal(stop.handle, handle)
+    test.equal(stop.fade, 0.75)
+    test.equal(harness.closed[1], 1)
 end
 
 function suite.countsAgainstTheVoiceCeiling(): nil
