@@ -1,13 +1,13 @@
 module tecs.internal.audiosynth
 
 --[[
-What `tecs.audio` lends `tecs.audio.synth`.
+What `tecs.audio` lends `tecs.audio.synth` and `tecs.audio.fm`.
 
-A synthesizer is a voice of the mixer, so it needs a slot taken the way
-`Audio.play` takes one and the backend its SoundFont loads into. Both live in
+A synthesizer, General MIDI or FM, is a voice of the mixer, so it needs a slot
+taken the way `Audio.play` takes one and the backend it opens on. Both live in
 fields `tecs.audio` keeps private, and a child module cannot reach them. This
-module is the seam between the two: `tecs.audio` fills `lent` for each mixer it makes, and
-`tecs.audio.synth` reads it. Nothing else should.
+module is the seam between them: `tecs.audio` fills `lent` for each mixer it
+makes, and the two synthesizer modules read it. Nothing else should.
 ]]
 
 local audiobackend = require("tecs.platform.audiobackend")

@@ -1,0 +1,382 @@
+module tecs.audio.fm
+
+--[[
+An emulated Yamaha OPL2 or OPL3 FM chip, played as one voice of the mixer.
+
+An [`Fm`](tecs.audio.fm.Fm) takes one voice slot the way `Audio.play` takes
+one, so it counts against `maxVoices`, joins a group, and follows group gain,
+group mute, group pause, master gain and master mute like any other voice.
+What it adds is the chip's register file: a game drives it with the same
+register writes a DOS driver sent to an AdLib or a Sound Blaster, and the
+emulator renders what the chip would have played.
+
+```nupp
+local mixer <const> = tecs.audio.newAudio()
+local chip <const> = assert(tecs.audio.fm.new(mixer, {chip = "opl2", group = "music"}))
+
+-- A held sine on channel 0 at 440 Hz, keyed on a tenth of a second ahead.
+local at <const> = chip:now() + 0.1
+chip:writes({
+    0x20, 0x01, 0x23, 0x21, -- multiple 1 on both operators, carrier sustains
+    0x40, 0x3F, 0x43, 0x00, -- modulator silent, carrier at full level
+    0x63, 0xF0, 0x83, 0x0F, -- carrier: instant attack, no decay, fast release
+    0xA0, 0x41, 0xB0, 0x32, -- frequency number 0x241, block 4, key on
+}, at)
+chip:write(0xB0, 0x12, at + 0.5) -- key off half a second later
+```
+
+The interface is registers and nothing else: no notes, no instruments, no
+channels allocated on a game's behalf. That is the whole contract of the real
+chip, and it is what lets a port of a game that drove one replay its music
+driver's output unchanged, timing and all. A note-level layer belongs above
+this, in the game or in a driver written for it.
+
+## The chips
+
+`"opl2"` is the YM3812: nine 2-operator channels, four waveforms once bit 5 of
+register 0x01 enables them, and rhythm mode through 0xBD. Its registers run
+from 0x00 to 0xFF and it is mono, so it plays the same on both sides.
+
+`"opl3"` is the YMF262: eighteen channels in two banks, the second at 0x100 to
+0x1FF, eight waveforms, and 4-operator voices from pairs of channels that
+register 0x104 joins. Most of that waits on the NEW bit, bit 0 of 0x105: until
+a game sets it, the chip behaves as an OPL2 with a second bank it cannot reach,
+since the chip itself folds a write to 0x1xx back onto bank 0. Once it is set,
+each channel's output is chosen by bits 4 and 5 of its 0xC0 register, left and
+right, and a channel with neither set is silent. Bits 6 and 7 select the
+chip's third and fourth outputs, which a stereo card did not wire to anything,
+and neither do these.
+
+Status and timer reads are not offered. A driver that polled the timers to pace
+itself paces itself on `now` instead.
+
+The chip runs at its own rate, `rate` samples a second, which is 49715: the
+input clock over 72 on the OPL2 and over 288 on the OPL3, 49 715.9 Hz, as the
+emulator truncates it. The mixer resamples it to the output's.
+
+## The clock and `at`
+
+Every writing method takes an optional `at`, in seconds on the chip's own
+clock, which `now` reads. The clock is the samples the chip has rendered over
+`rate`, so it is the audio clock rather than the frame clock: it does not drift
+against what is heard, it never runs backwards, and it stands still while
+nothing renders the chip, which is the case before the first output buffer,
+while its group is paused, and for good on a mixer with no output.
+
+A write lands on the first chip sample at or after `at`, and where it lands
+depends only on `at`, so the same schedule renders the same samples on every
+run and every machine, whatever the frame rate did. A time within a millionth
+of a sample of a whole sample counts as that sample, so `now() + n / rate`
+lands on sample `n` from now despite rounding. Writes landing on the same
+sample apply together, in the order they were sent, before that sample is
+generated. So a key-off and a key-on there count as no change: to strike a
+note again, space the writes one sample apart, `1 / rate`.
+
+An omitted `at`, and one already in the past, means the next sample. Sending
+each write as it falls due therefore works, but puts it wherever the next
+output buffer happens to start, so its timing follows the frame rate. A music
+driver sends a little ahead instead: run its tick against `now` with a
+lookahead of a frame or two, say 50 milliseconds, and stamp each tick's writes
+with the tick's time.
+
+## The queue
+
+Writes cross to the audio thread through a bounded queue the output callback
+never waits on, and that thread holds as many again in its schedule for writes
+sent ahead of their time. Either is 4096 writes. A write that finds no room is
+refused rather than waiting or growing anything: the method returns false and
+the write is gone. `writes` is all or nothing, so a tick's writes are never
+applied in part, and a batch of more than 4096 can never be taken. A driver
+streaming with a short lookahead never comes near the bound.
+
+## Without an output
+
+A mixer with no output device, or one made with a test backend, still makes a
+chip whose every call succeeds. On a mixer with no output nothing renders, so
+nothing is heard and `now` stays at zero. A test backend that supplies `openFm`
+receives every write through the [`FmPort`](tecs.platform.audiobackend.FmPort)
+it returns, which is how a harness logs them; one that does not gets the silent
+port, which accepts and drops them.
+
+## The emulator
+
+The emulation is the YM3812 and YMF262 of ymfm-oxide, a pure-Rust port of
+ymfm, Aaron Giles's BSD-3-Clause emulator of the Yamaha FM chips, which the
+crate holds to ymfm sample for sample. Tecs links it as a Cargo dependency
+pinned to one commit, and `THIRD_PARTY_NOTICES.md` carries its licence.
+]]
+
+local audio = require("tecs.audio")
+local audiobackend = require("tecs.platform.audiobackend")
+local audiosynth = require("tecs.internal.audiosynth")
+
+--- The rate the chip renders at, in samples a second: `tecsaudio::fm::RATE`,
+--- which a Rust test holds to what the emulator reports for both chips.
+local RATE: integer = 49715
+
+--- The writes the queue holds, which is also the largest batch `writes` takes.
+local QUEUE_WRITES: integer = 4096
+
+--- The last register each chip decodes.
+local LAST_REGISTER: {[string]: integer} = {opl2 = 0xFF, opl3 = 0x1FF}
+
+--- Names a chip `new` can make: the YM3812 (OPL2) or the YMF262 (OPL3).
+export type Chip = audiobackend.FmChip
+
+--- Configures `new`.
+---
+--- Read once, when the chip is made. Nothing here is retained.
+export type Options = {
+    --- Caller-writable. Selects the chip, `"opl2"` or `"opl3"`, and defaults
+    --- to `"opl2"`.
+    chip: Chip?,
+
+    --- Caller-writable. Selects the group the chip's voice joins, so the
+    --- group's gain, mute and pause apply to it. Defaults to none.
+    group: string?,
+
+    --- Caller-writable. Sets the voice's linear gain before group and master
+    --- gain, and defaults to one.
+    gain: number?
+}
+
+--- One emulated FM chip, playing as one voice of a mixer.
+---
+--- Every writing method returns whether its writes were queued, which is false
+--- only when the bounded queue is full or the chip has been destroyed. None of
+--- them raises for either, because a write that cannot be queued is not a
+--- reason for a frame to stop. A register or value outside the chip's range
+--- raises, because it is a mistake in the call. Nothing here is thread safe:
+--- call it from the thread that owns the mixer.
+export record Fm
+    --- Read-only. Reports the rate the chip renders at, 49715 samples a
+    --- second, which is the unit of its clock. One sample is `1 / rate`
+    --- seconds of `at`.
+    rate: integer
+
+    --- Read-only. Reports which chip this is, `"opl2"` or `"opl3"`.
+    chip: Chip
+
+    @private mixer: audio.Audio
+    @private port: audiobackend.FmPort
+    @private voice: integer
+    @private destroyed: boolean
+    @private lastRegister: integer
+
+    write: function(exclusive self: Fm, register: integer, value: integer, at: number?): boolean
+    writes: function(exclusive self: Fm, pairs: {integer}, at: number?): boolean
+    reset: function(exclusive self: Fm, at: number?): boolean
+    now: function(borrows self: Fm): number
+    setGain: function(exclusive self: Fm, gain: number): nil
+    destroy: function(exclusive self: Fm): nil
+end
+
+--- Returns what `tecs.audio` lent the synthesizer modules for one mixer.
+local function lender(mixer: audio.Audio): audiosynth.Lender
+    return assert(audiosynth.lent[mixer], "tecs.audio registered no synthesizer seam for this mixer")
+end
+
+--- Writes a register address the way the chip's documentation does.
+local function hex(value: integer): string
+    if value < 0 then
+        return tostring(value)
+    end
+
+    return string.format("0x%X", value)
+end
+
+--- Raises unless a register and value are in range for the chip.
+--- @raises string when the register is past the chip's last or the value is
+---     outside 0 to 255
+local function check(name: string, borrows self: Fm, register: integer, value: integer): nil
+    local where = "tecs.audio.fm." .. name .. ": "
+    if register < 0 or register > self.lastRegister then
+        local range = "from 0x00 to " .. hex(self.lastRegister)
+        error(where .. "an " .. self.chip .. " register must be " .. range .. ", got " .. hex(register), 3)
+    end
+    if value < 0 or value > 0xFF then
+        error(where .. "a register value must be from 0 to 255, got " .. tostring(value), 3)
+    end
+end
+
+--- Makes an emulated FM chip and starts its voice.
+---
+--- The voice starts sounding with the mixer's next flush, which `update` makes
+--- once per frame, and writes sent before then wait for it. The chip starts in
+--- its power-on state, every register zero, and sounds until `destroy`. A voice
+--- `stopAll` or `stopGroup` ended does not come back: make another chip
+--- instead.
+---
+--- @param mixer the mixer the voice plays on
+--- @param options the chip, group and gain, or nil for an OPL2 in no group at
+---     a gain of one
+--- @return the chip, or nil when its voice could not start. A mixer with no
+---     output is not such a case: it returns a chip that renders nothing.
+--- @return the reason, when the first return is nil: every voice is busy, or
+---     the backend refused the chip
+--- @raises string when `chip` is neither `"opl2"` nor `"opl3"`
+export function new(mixer: audio.Audio, options: Options?): (Fm?, string?)
+    local chip = (options and options.chip) or "opl2"
+    local lastRegister = LAST_REGISTER[chip]
+    if lastRegister == nil then
+        error("tecs.audio.fm.new: chip must be \"opl2\" or \"opl3\", got " .. tostring(chip), 2)
+    end
+
+    local function made(port: audiobackend.FmPort, voice: integer): Fm
+        return new Fm(
+            rate = RATE,
+            chip = chip,
+            mixer = mixer,
+            port = port,
+            voice = voice,
+            destroyed = false,
+            lastRegister = lastRegister
+        )
+    end
+
+    local seam = lender(mixer)
+    local voice = seam.start((options and options.gain) or 1, options and options.group)
+    if voice == 0 then
+        if mixer.available then
+            return nil, "every voice is busy, so the FM chip has none to play through"
+        end
+
+        return made(audiobackend.silentFm(), 0)
+    end
+
+    local open = seam.backend().openFm
+    if open == nil then
+        return made(audiobackend.silentFm(), voice)
+    end
+    -- Opened before the voice's start is flushed, because the start is what
+    -- hands the chip to the mixer.
+    local port, reason = open(voice, chip)
+    if port == nil then
+        mixer:stop(voice)
+
+        return nil, reason or "the backend opened no FM chip"
+    end
+
+    return made(port, voice)
+end
+
+--- Queues one register write.
+---
+--- @param self the chip to write to
+--- @param register from 0x00 to 0xFF on an OPL2, and to 0x1FF on an OPL3,
+---     whose second bank is 0x100 up
+--- @param value from 0 to 255
+--- @param at seconds on the chip clock, where nil or a time already passed
+---     means the next sample
+--- @return whether the write was queued, false when the queue is full or the
+---     chip is destroyed
+--- @raises string when the register or the value is outside its range
+function Fm.write(exclusive self: Fm, register: integer, value: integer, at: number?): boolean
+    check("write", self, register, value)
+    if self.destroyed then
+        return false
+    end
+
+    return self.port.write(register, value, at or 0)
+end
+
+--- Queues a batch of register writes for one time, all or none.
+---
+--- The batch is what one tick of a music driver writes, and taking it whole is
+--- the point: a tick applied in part plays a note with half its instrument.
+--- Every pair is checked before anything is queued.
+---
+--- @param self the chip to write to
+--- @param pairs a flat list alternating register and value, as
+---     `{0xA0, 0x41, 0xB0, 0x32}`, applied in order. The list is read during
+---     the call and not retained. An empty list queues nothing and returns
+---     true.
+--- @param at seconds on the chip clock for every write in the batch, read as
+---     `write` reads it
+--- @return whether the whole batch was queued: false when the queue cannot
+---     hold all of it, which is always the case past 4096 pairs, or when the
+---     chip is destroyed
+--- @raises string when the list has an odd length
+--- @raises string when a register or a value is outside its range
+function Fm.writes(exclusive self: Fm, pairs: {integer}, at: number?): boolean
+    local length = #pairs
+    if length % 2 ~= 0 then
+        error(
+            "tecs.audio.fm.writes: pairs must alternate register and value, got " .. tostring(length) .. " numbers",
+            2
+        )
+    end
+    for index = 1, length, 2 do
+        check("writes", self, pairs[index], pairs[index + 1])
+    end
+    if self.destroyed then
+        return false
+    end
+    local count = length // 2
+    if count == 0 then
+        return true
+    end
+    if count > QUEUE_WRITES then
+        return false
+    end
+
+    return self.port.writes(pairs, count, at or 0)
+end
+
+--- Returns the chip to its power-on state.
+---
+--- Every register goes back to zero, so every note stops at once without its
+--- release, and the chip's internal clocks start again. Writes sent before
+--- this call and due at or after `at` are discarded, scheduled ones included;
+--- those due before it still play up to it. Writes sent after it apply as
+--- usual, including at `at` itself.
+---
+--- @param self the chip to reset
+--- @param at seconds on the chip clock, read as `write` reads it
+--- @return whether the reset was queued
+function Fm.reset(exclusive self: Fm, at: number?): boolean
+    if self.destroyed then
+        return false
+    end
+
+    return self.port.reset(at or 0)
+end
+
+--- Returns the chip clock, for computing `at`.
+---
+--- @param self the chip to read
+--- @return seconds of audio the chip has rendered: monotonic, zero before its
+---     first sample, still while its group is paused, and zero for good on a
+---     mixer with no output. It leads what is heard by the output's own
+---     latency, and leads the mix by at most a sample or two.
+function Fm.now(borrows self: Fm): number
+    if self.destroyed then
+        return 0
+    end
+
+    return self.port.now()
+end
+
+--- Sets the chip's gain, before its group's and the master's.
+---
+--- @param self the chip to scale
+--- @param gain linear amplitude rather than decibels, applied from the next
+---     output buffer rather than ramped
+function Fm.setGain(exclusive self: Fm, gain: number): nil
+    self.mixer:setGain(self.voice, gain)
+end
+
+--- Stops the chip's voice and frees the emulator. Safe more than once.
+---
+--- The voice stops without a fade, so a note still sounding is cut. Key the
+--- notes off a little before this for a softer ending.
+---
+--- @param self the chip to destroy
+function Fm.destroy(exclusive self: Fm): nil
+    if self.destroyed then
+        return
+    end
+    self.destroyed = true
+    self.mixer:stop(self.voice)
+    self.port.close()
+end

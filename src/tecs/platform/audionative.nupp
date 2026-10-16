@@ -77,6 +77,15 @@ cdef struct tecsAudioFontId
     value: uint32
 end
 
+--- One register write in a batch for `tecs_audio_fm_writes`.
+---
+--- The value is sixteen bits rather than eight so the struct has no padding
+--- for the two sides to disagree about; `layoutMismatch` checks its size.
+cdef struct tecsAudioFmWrite
+    address: uint16
+    value: uint16
+end
+
 --- One captured sample, so a block of them can be a `carray`.
 ---
 --- `carray` takes a struct type, and the captured samples are bare floats, so
@@ -181,6 +190,26 @@ cdef function tecs_audio_synth_now(borrows synth: voidptr?): number
 
 cdef function tecs_audio_synth_close(borrows synth: voidptr?)
 
+-- The FM chip. A port is a handle of its own, as a synthesizer's is, and the
+-- batch of writes crosses as a `carray` of `tecsAudioFmWrite`.
+
+cdef function tecs_audio_fm_open(borrows device: voidptr?, handle: uint32, opl3: int32): voidptr?
+
+cdef function tecs_audio_fm_write(borrows fm: voidptr?, register: uint32, value: uint32, at: number): int32
+
+cdef function tecs_audio_fm_writes(
+    borrows fm: voidptr?,
+    borrows writes: tecsAudioFmWrite*,
+    count: uint32,
+    at: number
+): int32
+
+cdef function tecs_audio_fm_reset(borrows fm: voidptr?, at: number): int32
+
+cdef function tecs_audio_fm_now(borrows fm: voidptr?): number
+
+cdef function tecs_audio_fm_close(borrows fm: voidptr?)
+
 -- Device listing and recording. Neither a listing nor a capture crosses as a
 -- struct: a device name has no fixed width worth choosing, and a capture is a
 -- handle. So these add nothing for `layoutMismatch` to compare, and the
@@ -276,6 +305,14 @@ local LAYOUT_EVENT: integer = 1
 --- Selects the clip-info struct in `tecs_audio_layout`.
 local LAYOUT_CLIP_INFO: integer = 2
 
+--- Selects the FM register-write struct in `tecs_audio_layout`.
+local LAYOUT_FM_WRITE: integer = 3
+
+--- The writes one FM batch may carry, which is the chip's whole queue: a
+--- larger batch could never be taken, so the binding refuses it before the
+--- crossing and needs no larger buffer.
+local FM_BATCH: integer = 4096
+
 --- Reports where LuaJIT and the library disagree about a struct size.
 ---
 --- Two descriptions of one memory layout can drift, and the failure a drift
@@ -284,11 +321,16 @@ local LAYOUT_CLIP_INFO: integer = 2
 ---
 --- @return the reason, or nil when every struct agrees
 local function layoutMismatch(): string?
-    local names: {string} = {"tecsAudioCommand", "tecsAudioEvent", "tecsAudioClipInfo"}
-    local kinds: {integer} = {LAYOUT_COMMAND, LAYOUT_EVENT, LAYOUT_CLIP_INFO}
+    local names: {string} = {"tecsAudioCommand", "tecsAudioEvent", "tecsAudioClipInfo", "tecsAudioFmWrite"}
+    local kinds: {integer} = {LAYOUT_COMMAND, LAYOUT_EVENT, LAYOUT_CLIP_INFO, LAYOUT_FM_WRITE}
     local sizes: {
         integer
-    } = {ffi.sizeof<tecsAudioCommand>(), ffi.sizeof<tecsAudioEvent>(), ffi.sizeof<tecsAudioClipInfo>(),}
+    } = {
+        ffi.sizeof<tecsAudioCommand>(),
+        ffi.sizeof<tecsAudioEvent>(),
+        ffi.sizeof<tecsAudioClipInfo>(),
+        ffi.sizeof<tecsAudioFmWrite>(),
+    }
     for index = 1, #kinds do
         local reported = tecs_audio_layout(kinds[index] as uint32) as integer
         if reported ~= sizes[index] then
@@ -514,6 +556,69 @@ local function wrap(openDevice: function(): voidptr?, absent: string): (audiobac
         end)
     end
 
+    --- The batch buffer every FM port on this device fills. One is enough:
+    --- the ports are only ever written from the frame thread, and each batch
+    --- crosses before the next is filled.
+    local batch = carray(tecsAudioFmWrite, FM_BATCH)
+
+    local function openFm(handle: integer, chip: audiobackend.FmChip): (audiobackend.FmPort?, string?)
+        if closed[1] then
+            return nil, "the audio output is closed"
+        end
+        local fm = tecs_audio_fm_open(device, handle as uint32, (chip == "opl3" and 1 or 0) as int32)
+        if fm == nil then
+            return nil, reason("tecsaudio opened no FM chip")
+        end
+        local released = {false}
+
+        return new audiobackend.FmPort(
+            write = function(register: integer, value: integer, at: number): boolean
+                if released[1] then
+                    return false
+                end
+
+                return tecs_audio_fm_write(fm, register as uint32, value as uint32, at) ~= 0
+            end,
+            writes = function(pairs: {integer}, count: integer, at: number): boolean
+                if released[1] or count > FM_BATCH then
+                    return false
+                end
+                for index = 0, count - 1 do
+                    -- The index stays below `FM_BATCH` because of the check
+                    -- above, which the checker cannot read off a `carray`.
+                    @unsafe do
+                        local target = batch[index]
+                        target.address = pairs[2 * index + 1] as uint32
+                        target.value = pairs[2 * index + 2] as uint32
+                    end
+                end
+
+                return tecs_audio_fm_writes(fm, batch, count as uint32, at) ~= 0
+            end,
+            reset = function(at: number): boolean
+                if released[1] then
+                    return false
+                end
+
+                return tecs_audio_fm_reset(fm, at) ~= 0
+            end,
+            now = function(): number
+                if released[1] then
+                    return 0
+                end
+
+                return tecs_audio_fm_now(fm)
+            end,
+            close = function(): nil
+                if released[1] then
+                    return
+                end
+                released[1] = true
+                tecs_audio_fm_close(fm)
+            end
+        )
+    end
+
     return new audiobackend.Backend(
         failure = function(): string?
             if not closed[1] and tecs_audio_failed(device) ~= 0 then
@@ -561,6 +666,7 @@ local function wrap(openDevice: function(): voidptr?, absent: string): (audiobac
             end
         end,
         openSynth = openSynth,
+        openFm = openFm,
         close = function(): nil
             if closed[1] then
                 return

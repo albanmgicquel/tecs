@@ -50,9 +50,9 @@ test suite reach the same world without starting a graphics stack.
 - Camera, layers with positioning modes, images, clips, sprite sheets with
   animation, and distance-field text.
 - Input across keyboard, pointer, gamepad and touch; audio playback, recording
-  and device enumeration; General MIDI from a SoundFont; physics over Rapier;
-  sequencing with tweening; asset orchestration; file watching; and an MCP
-  debug server.
+  and device enumeration; General MIDI from a SoundFont; an emulated OPL2 and
+  OPL3 FM chip; physics over Rapier; sequencing with tweening; asset
+  orchestration; file watching; and an MCP debug server.
 
 - [Tiled TMX maps and TSX tilesets](docs/tiled/index.md), animated tile and image
   layers, object factories, runtime tile edits and authored collision outlines.
@@ -531,6 +531,87 @@ monotonic clock instead of rendered frames, chosen when the synth is made.
 Nothing above the port changes. It is deferred because nothing needs it yet,
 and what it costs is the determinism above: a hardware synth cannot be rendered
 offline.
+
+## FM synthesis is a register-level chip, emulated by a Rust crate
+
+`tecs.audio.fm` is a Yamaha OPL2 (YM3812) or OPL3 (YMF262) a game drives by
+writing its registers, played as one voice of the mixer on the same scheduler
+as the General MIDI synth. It is for the music and effects of the DOS era,
+which were written as streams of register writes to an AdLib or a Sound
+Blaster, and a port of such a game wants to replay what its driver wrote, not
+an approximation of it.
+
+The interface is registers only: `write`, `writes` for a tick's batch, `reset`
+and a clock. A note-and-instrument layer was the alternative, and it lost
+because it is the part that differs between games. Every driver had its own
+instrument format, its own channel allocation and its own idea of a note, and
+an engine layer would have had to pick one or grow into a superset of all of
+them. The chip is the one contract they all shared. A game that wants notes
+writes a driver for its own format above this, in Nupp, and gets exactly the
+sound that format made. Status and timer reads are left out for the same
+reason they are left out of the scheduler: a driver that paced itself on the
+chip's timers paces itself on `now` instead, and a read would need an answer
+from the audio thread inside the call.
+
+Writes land on the first chip sample at or after their time, a grid of one
+rather than the synth's eight, because a register write takes effect on the
+next sample the chip computes and a driver's timing is part of its sound: a
+key-off and key-on a sample apart is a retrigger, and moving it eight samples
+changes the attack. The scheduler names its grid per target to allow that,
+eight frames for the synth and one for the chip, and the ring, the schedule
+and the source are otherwise the synth's, so the queue bound and the clock
+behave the same way. Writes due on one sample all apply before that sample is
+generated, in sending order, so a key-off and a key-on there count as no
+change: a driver that re-strikes a note spaces the two writes one sample apart,
+which is what the hardware's write timing did anyway. `writes` is all or
+nothing, because a tick applied in part plays a note with half its instrument.
+
+A reset carries a time like a write. Writes sent before it and due before it
+still apply; those due at or after it are discarded, so nothing scheduled
+earlier plays over the silence it makes, and writes sent after it apply as
+usual, at its own sample included. The synth's reset, which lands at its next
+block, keeps its old meaning; the chip's needed a time because a driver
+restarting a song schedules the restart rather than taking it whenever the
+next buffer begins.
+
+The chip renders at its own rate and the mixer voice resamples it as it would
+a clip, so the clock counts chip samples and the output rate does not leak
+into a driver's timing. The rate is the input clock over 72 on the OPL2,
+3.579545 MHz, and over 288 on the OPL3, four times that: 49 715.9 Hz, which
+the emulator truncates to 49715. Rounding it to 49716 instead, as an earlier
+draft did, would be closer by under twenty parts per million, which is a
+thirtieth of a cent of pitch and under a tenth of a second an hour of tempo,
+below anything heard; the clock simply has to agree with the emulator, and a test
+holds `rate` to what the emulator reports for both chips.
+
+The emulator is ymfm-oxide (<https://github.com/albanmgicquel/ymfm-oxide>), a
+pure-Rust, `no_std`, dependency-free port of ymfm, Aaron Giles's BSD-3-Clause
+emulator of the Yamaha FM family, used for its YM3812 and YMF262: OPL3
+4-operator pairs, all eight waveforms, the NEW bit, stereo and rhythm mode.
+Linking ymfm's C++ was the alternative, and it lost to the build: every other
+native service here is Cargo only, and a C++ toolchain on every platform,
+Windows included, for one module was not a cost worth carrying. ymfm was the
+source because it is permissively licensed and written to be read, which is
+what makes a port checkable. The candidates under the LGPL or the GPL,
+Nuked-OPL3 and DOSBox's among them, are excluded by the licence rule in
+`THIRD_PARTY_NOTICES.md`, and so is anything developed from them.
+
+The port lives in its own crate rather than in this tree, and it was first
+written here. Kept here, Tecs carried a few thousand lines of BSD-3-Clause
+source with its own notices, its golden renders and a C++ oracle, none of it
+about the engine; as a crate it is one dependency with one notice, its check
+lives with its code, and the other chips ymfm models come with it for whoever
+wants them. The crate holds itself to ymfm sample for sample with golden
+renders of synthetic register logs, made by ymfm through an oracle program,
+and a randomized differential test against it. It is a git dependency pinned
+to a full commit, and `Cargo.lock` records that commit, so a build cannot pick
+up a different emulator without a change here. `tecs-audio` drives it through
+the chips' own ports: a register below 0x100 through the address port at
+offset 0 and the data port at 1, one from 0x100 up through the OPL3's
+second-bank address port at 2 and the data port at 3, which is how the chip
+itself folds a second-bank write back to the first until the NEW bit is set.
+The OPL3's left and right are its outputs A and B; the OPL2 is mono and plays
+its one output on both sides.
 
 ## Device vocabularies follow the library that reports them
 

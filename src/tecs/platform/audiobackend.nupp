@@ -123,6 +123,43 @@ export record SynthPort
     close: function(): nil
 end
 
+--- Names the FM chip an [`FmPort`](tecs.platform.audiobackend.FmPort) drives:
+--- the Yamaha YM3812 (OPL2) or the YMF262 (OPL3).
+export type FmChip = "opl2" | "opl3"
+
+--- Sends register writes to one emulated FM chip a backend renders as a voice.
+---
+--- Pushed rather than called back, as a
+--- [`SynthPort`](tecs.platform.audiobackend.SynthPort) is: each function queues or
+--- reads on the frame thread and returns, and the backend's audio thread takes the
+--- writes from a bounded queue it never waits on. Every field is a plain function, so a
+--- test that wants to see what a game sent is a record of closures that logs. Arguments
+--- arrive checked: a register in the chip's range and a value from 0 to 255.
+export record FmPort
+    --- Read-only. Queues one register write for `at` seconds on this port's
+    --- clock, where zero or less means the next sample, and reports whether
+    --- the queue had room.
+    write: function(register: integer, value: integer, at: number): boolean
+
+    --- Read-only. Queues the first `count` register and value pairs of
+    --- `pairs`, a flat list alternating register and value, for `at`, all or
+    --- none, and reports whether the queue took them. `count` is at most 4096.
+    writes: function(pairs: {integer}, count: integer, at: number): boolean
+
+    --- Read-only. Queues a return to the chip's power-on state for `at` that
+    --- discards every write sent before it and due at or after it, and
+    --- reports whether the queue had room.
+    reset: function(at: number): boolean
+
+    --- Read-only. Reports the port's clock in seconds: the samples the chip
+    --- has rendered over its own rate. Zero until it renders.
+    now: function(): number
+
+    --- Read-only. Frees the port. Calling it twice is harmless, and nothing
+    --- sent afterwards reaches anything.
+    close: function(): nil
+end
+
 --- Selects residency for a load.
 ---
 --- `"auto"` measures the clip's duration against the configured streaming
@@ -207,6 +244,13 @@ export record Backend
     --- the port, or nil and a reason. Omitted by a backend with no
     --- synthesizer, which `tecs.audio.synth` answers with `silentSynth`.
     openSynth: (function(font: integer, handle: integer, polyphony: integer, effects: boolean): (SynthPort?, string?))?
+
+    --- Read-only. Opens an emulated FM chip for the voice `handle` names,
+    --- which starts sounding when a `PLAY` carrying that handle and the
+    --- `SYNTH` flag is submitted. Returns the port, or nil and a reason.
+    --- Omitted by a backend with no FM emulator, which `tecs.audio.fm`
+    --- answers with `silentFm`.
+    openFm: (function(handle: integer, chip: FmChip): (FmPort?, string?))?
 
     --- Read-only. Stops everything and closes the output. Calling it twice is
     --- harmless.
@@ -371,8 +415,8 @@ export const STEREO: integer = 4
 --- samples.
 export const STREAM: integer = 8
 
---- Marks a `PLAY` whose input is the synthesizer `openSynth` opened for the
---- command's handle, rather than a clip.
+--- Marks a `PLAY` whose input is the synthesizer `openSynth` or the chip
+--- `openFm` opened for the command's handle, rather than a clip.
 export const SYNTH: integer = 16
 
 --- Creates one zeroed command, for a caller filling a reusable buffer.
@@ -454,6 +498,32 @@ export function silentSynth(): SynthPort
             return true
         end,
         reset = function(): boolean
+            return true
+        end,
+        now = function(): number
+            return 0
+        end,
+        close = function(): nil
+        end
+    )
+end
+
+--- Creates an FM port that accepts everything and renders nothing.
+---
+--- What a chip gets on a mixer with no output, and on a backend that has no FM
+--- emulator of its own. Every write is taken and dropped, and the clock stays
+--- at zero because no sample is ever rendered.
+---
+--- @return a port whose writes all succeed and whose clock reads zero
+export function silentFm(): FmPort
+    return new FmPort(
+        write = function(_register: integer, _value: integer, _at: number): boolean
+            return true
+        end,
+        writes = function(_pairs: {integer}, _count: integer, _at: number): boolean
+            return true
+        end,
+        reset = function(_at: number): boolean
             return true
         end,
         now = function(): number

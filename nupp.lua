@@ -234,6 +234,7 @@ return {
                     "tecs.internal.assetnative",
                     "tecs.assets",
                     "tecs.audio",
+                    "tecs.audio.fm",
                     "tecs.audio.synth",
                     "tecs.internal.audiosynth",
                     "tecs.ecs",
