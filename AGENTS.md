@@ -108,7 +108,7 @@ tecs/
 │   ├── platform/           # Window, events, audio and gamepad backends
 │   ├── physics/            # Rapier contract and binding
 │   ├── input.nupp          # Gameplay input over the platform event stream
-│   ├── audio/              # Clips, voices, groups, limits, the Sound component, General MIDI, Yamaha FM
+│   ├── audio/              # Clips, voices, groups, limits, the Sound component, General MIDI, Yamaha FM, music
 │   ├── sequence.nupp       # Sequencer, with the tween runtime inside it
 │   ├── assets.nupp         # Asset orchestration
 │   ├── mcp.nupp            # Debug server: transport, tools, sandbox

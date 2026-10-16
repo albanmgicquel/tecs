@@ -51,9 +51,9 @@ test suite reach the same world without starting a graphics stack.
   animation, and distance-field text.
 - Input across keyboard, pointer, gamepad and touch; audio playback, recording
   and device enumeration; General MIDI from a SoundFont; emulated Yamaha FM
-  chips, from the OPL2 and OPL3 to the YM2612 and the OPL4; physics over
-  Rapier; sequencing with tweening; asset orchestration; file watching; and an
-  MCP debug server.
+  chips, from the OPL2 and OPL3 to the YM2612 and the OPL4; MIDI, VGM, VGZ and
+  DRO music played on them; physics over Rapier; sequencing with tweening;
+  asset orchestration; file watching; and an MCP debug server.
 
 - [Tiled TMX maps and TSX tilesets](docs/tiled/index.md), animated tile and image
   layers, object factories, runtime tile edits and authored collision outlines.
@@ -671,6 +671,62 @@ status read can drive.
 An idle chip at its usual clock costs between a fifth of a percent and one
 percent of a core in a release build, measured over a second of rendering; the
 YMF288 is the dearest and the YM2149 the cheapest.
+
+## Music is two asset kinds and a player that owns its voices
+
+`tecs.audio.music` plays songs on the synthesizer voices: Standard MIDI Files on
+the General MIDI synth, and VGM, VGZ and DRO register logs on emulated FM chips.
+Each format is a `tecs.assets.Kind`, `"music.midi"` and `"music.fm"`,
+which are content kind names and so a compatibility surface, and a
+`tecs.audio.music.Player` plays what one loaded.
+
+The files are parsed in Nupp, on the loader's readiness pump, up to 65 536
+commands a pass, so a large log loads across frames instead of stalling one.
+A worker lane was the alternative and lost: it needs the `workers` host
+feature and a sendable parser, and its result, tens of thousands of events,
+would be copied back across the lane only to be read on the frame thread
+anyway. Parsing in Rust lost for the same reason, with a structured payload to
+carry over the C ABI besides. A log is kept as two integer arrays, a tick and
+a packed chip, register and value a write, rather than a record per write,
+because a long VGM holds hundreds of thousands of them. VGZ inflates through
+`nupp.compression`, which is Nupp's and so is what Tecs uses: the host now
+stages the `native-compression` feature beside `native-files` and
+`native-net`, in the three places that list them. `flate2`, already in the
+Cargo graph through `tecs-assets`, would have worked too, and is exactly the
+wrapper around a Nupp facility the project does not keep.
+
+A player owns its voices, a synth for a MIDI song and one chip for each chip a
+log names, and the handle it plays, which it retains and watches for a reload.
+The mixer's `update` advances every player made on it, because a game already
+calls that every frame and keeps calling it while its world is paused; a
+`Music` component was the alternative, and it lost because a song is a handle
+and a set of voices, neither of which is data a snapshot could carry or a row
+could own. The player schedules ahead on the voices' own clock, `lookahead`
+seconds at a time, so timing follows the audio rather than the frame rate. When
+a stall makes an event late, that event plays at once and the rest keep their
+distance from it: the song slips by the stall instead of rushing what it
+missed, and a stall over a rest changes nothing. A loop ends before the
+events at its end, which belong to the next pass, and held notes are released
+there; the song's own end takes everything, so its closing note offs are sent.
+A song loops forever when it has a loop point and plays once when it has none.
+
+Seeking resets the voices and rebuilds their state rather than replaying the
+song up to the point: a MIDI song sends the programs, controllers and bends in
+force there, and a log writes the last value of every register. The second is
+exact for everything a register holds and approximate for what a chip holds
+besides, envelopes in flight and the OPN's shared key-on register among them,
+so a note held across the point comes back at its next key-on. System
+exclusive messages are kept in a song but not sent, because the synth takes
+short messages; the resets they carry are what a fresh synth already is.
+
+A VGM file is a log of every chip in a machine, and a Mega Drive's has an
+SN76489 beside its YM2612. Refusing such a file because one of its chips is
+not a Yamaha one would make the YM2612 useless, so each chip Tecs cannot
+emulate is skipped with a reason in `skipped`, and only a file left with
+nothing is refused. The YM2612's DAC writes from a data bank, the `0x8n`
+commands and the DAC streams, are turned into ordinary register writes at
+their times when the file is read, so the player knows nothing of them, and a
+format 2 MIDI file's patterns play one after another.
 
 ## Device vocabularies follow the library that reports them
 

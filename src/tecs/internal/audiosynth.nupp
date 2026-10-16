@@ -1,13 +1,15 @@
 module tecs.internal.audiosynth
 
 --[[
-What `tecs.audio` lends `tecs.audio.synth` and `tecs.audio.fm`.
+What `tecs.audio` lends `tecs.audio.synth`, `tecs.audio.fm` and the music
+players.
 
 A synthesizer, General MIDI or FM, is a voice of the mixer, so it needs a slot
 taken the way `Audio.play` takes one and the backend it opens on. Both live in
 fields `tecs.audio` keeps private, and a child module cannot reach them. This
 module is the seam between them: `tecs.audio` fills `lent` for each mixer it
-makes, and the two synthesizer modules read it. Nothing else should.
+makes, and the two synthesizer modules read it. Nothing else should. The music
+players register in `updates`, which `Audio.update` runs.
 ]]
 
 local audiobackend = require("tecs.platform.audiobackend")
@@ -26,3 +28,8 @@ end
 --- Holds the lender each mixer registers when it is made, keyed weakly by the
 --- mixer so one that has gone takes its entry with it.
 export const lent: {[any]: Lender} = setmetatable({}, {__mode = "k"})
+
+--- Holds what each mixer's `update` advances besides its voices: the music
+--- players made on it, each a function that returns false once it is done
+--- and should be dropped. Keyed weakly by the mixer, as `lent` is.
+export const updates: {[any]: {function(): boolean}} = setmetatable({}, {__mode = "k"})

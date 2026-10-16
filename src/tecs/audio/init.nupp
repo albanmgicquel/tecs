@@ -2229,7 +2229,8 @@ end
 --- Call once per frame with the frame's step. The step advances cooldowns, and
 --- nothing else here needs time: a fade is the backend's to run, and a voice is
 --- over when the backend says so rather than when a clock here says it should
---- be.
+--- be. It also advances every [`Player`](tecs.audio.music.Player) made on this
+--- mixer, which schedules on its voices' own clock rather than on the step.
 ---
 --- Not a world system, and `install` deliberately does not add one: reaping has
 --- to continue during a world pause, so an application drives this from the
@@ -2243,6 +2244,22 @@ end
 function Audio.update(exclusive self: Audio, dt: number?): integer
     if self.closed then
         return 0
+    end
+    -- Music players first, so what they schedule this frame rides the same
+    -- flush as the voices they start.
+    local updates = audiosynth.updates[self]
+    if updates ~= nil then
+        local kept: integer = 0
+        for index = 1, #updates do
+            local advance = updates[index]
+            if advance() then
+                kept = kept + 1
+                updates[kept] = advance
+            end
+        end
+        for index = #updates, kept + 1, -1 do
+            updates[index] = nil
+        end
     end
     local observe = self.backend.failure
     if self.failureReason == nil and observe ~= nil then
