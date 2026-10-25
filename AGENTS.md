@@ -329,9 +329,6 @@ Three places, and they hold different things:
   comparison. It does not restate a signature, and it carries no handwritten module catalog, because the
   reference already has one. `nupp task docs-check` requires a one-line `description:` on every page and
   refuses an em dash; `nupp task docs-dev` serves the site while you write.
-- **`README.md`** is the design record. It holds why, not what: the decision, the alternative that
-  lost, and the constraint that forced it. A change that only adds a function needs no entry; a
-  change that settles a question does.
 
 The failure this exists to prevent has already happened here. Pages ported from an earlier tree
 claimed writing `Transform` needed no dirty tracking and that `archetype:get` on a tag returns nil.
